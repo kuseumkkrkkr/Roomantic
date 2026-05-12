@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'screens/splash_screen.dart';
+import 'screens/main_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
-import 'screens/home_screen.dart';
 import 'controllers/auth_controller.dart';
 
 void main() {
@@ -22,7 +22,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GetMaterialApp(
-      title: 'Dorm Match',
+      title: 'Roomantic',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -125,7 +125,7 @@ class MyApp extends StatelessWidget {
         GetPage(name: '/splash', page: () => const SplashScreen()),
         GetPage(name: '/login', page: () => const LoginScreen()),
         GetPage(name: '/register', page: () => const RegisterScreen()),
-        GetPage(name: '/home', page: () => const HomeScreen()),
+        GetPage(name: '/home', page: () => const MainScreen()),
       ],
     );
   }

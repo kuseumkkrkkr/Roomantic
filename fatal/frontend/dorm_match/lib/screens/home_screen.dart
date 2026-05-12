@@ -5,6 +5,8 @@ import '../controllers/profile_controller.dart';
 import 'survey_screen.dart';
 import 'match_screen.dart';
 import 'login_screen.dart';
+import 'persona_detail_screen.dart';
+import 'notices_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -31,7 +33,7 @@ class _HomeScreenState extends State<HomeScreen> {
       body: SafeArea(
         child: CustomScrollView(
           slivers: [
-            // App bar
+            // Top bar
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
@@ -52,19 +54,37 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ],
                     ),
-                    IconButton(
-                      onPressed: () {
-                        _auth.logout();
-                        Get.offAll(() => const LoginScreen());
-                      },
-                      icon: const Icon(Icons.logout_rounded, color: Color(0xFF9CA3AF)),
+                    Row(
+                      children: [
+                        IconButton(
+                          onPressed: () {
+                            Get.snackbar(
+                              '알림',
+                              '새로운 알림이 없습니다.',
+                              snackPosition: SnackPosition.TOP,
+                              backgroundColor: const Color(0xFFE3F2FD),
+                              colorText: const Color(0xFF1565C0),
+                              margin: const EdgeInsets.all(16),
+                              borderRadius: 16,
+                            );
+                          },
+                          icon: const Icon(Icons.notifications_none_rounded, color: Color(0xFF6B7280)),
+                        ),
+                        IconButton(
+                          onPressed: () {
+                            _auth.logout();
+                            Get.offAll(() => const LoginScreen());
+                          },
+                          icon: const Icon(Icons.logout_rounded, color: Color(0xFF9CA3AF)),
+                        ),
+                      ],
                     ),
                   ],
                 ),
               ),
             ),
 
-            // Hero section - User profile card
+            // Hero card
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
@@ -106,7 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ),
                                 const SizedBox(height: 2),
                                 Text(
-                                  user?.studentId ?? '',
+                                  user?.isEnrolled == true ? (user?.studentId ?? '') : (user?.regionName ?? ''),
                                   style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.8), fontWeight: FontWeight.w500),
                                 ),
                               ],
@@ -128,12 +148,37 @@ class _HomeScreenState extends State<HomeScreen> {
                             bgColor: Colors.white.withValues(alpha: 0.15),
                           );
                         }
-                        return _heroButton(
-                          icon: Icons.check_circle_rounded,
-                          label: '설문조사 완료',
-                          subLabel: '내 유형 보기',
-                          onTap: () => Get.to(() => const SurveyScreen()),
-                          bgColor: Colors.white.withValues(alpha: 0.15),
+                        return Column(
+                          children: [
+                            _heroButton(
+                              icon: Icons.check_circle_rounded,
+                              label: '설문조사 완료',
+                              subLabel: '내 유형 보기',
+                              onTap: () {
+                                final profile = _profileCtrl.profile.value;
+                                if (profile != null) {
+                                  Get.to(() => PersonaDetailScreen(profile: profile));
+                                }
+                              },
+                              bgColor: Colors.white.withValues(alpha: 0.15),
+                            ),
+                            const SizedBox(height: 10),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(vertical: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Obx(() => Text(
+                                _profileCtrl.persona.value.isNotEmpty
+                                  ? '나의 유형: ${_profileCtrl.persona.value}'
+                                  : '유형 분석 중...',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white.withValues(alpha: 0.9)),
+                              )),
+                            ),
+                          ],
                         );
                       }),
                     ],
@@ -142,7 +187,50 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
 
-            // Quick Actions
+            // 현재 매칭중인 기숙사 찾기 버튼
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 4, 24, 8),
+                child: GestureDetector(
+                  onTap: () => Get.to(() => const MatchScreen()),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF7C3AED),
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: [
+                        BoxShadow(color: const Color(0x3F7C3AED), blurRadius: 16, offset: const Offset(0, 6)),
+                      ],
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.apartment, color: Colors.white, size: 24),
+                        SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '현재 매칭중인 기숙사 찾기',
+                                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Colors.white),
+                              ),
+                              SizedBox(height: 2),
+                              Text(
+                                '나와 꼭 맞는 기숙사 룸메이트를 찾아보세요',
+                                style: TextStyle(fontSize: 12, color: Color(0xFFD8B4FE)),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(Icons.arrow_forward_ios, color: Colors.white, size: 14),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // Quick actions
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
@@ -151,7 +239,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     Expanded(
                       child: _quickActionCard(
                         icon: Icons.people_alt_rounded,
-                        label: '매칭 결과',
+                        label: '셰어하우스 모드',
                         color: const Color(0xFF2563EB),
                         onTap: () => Get.to(() => const MatchScreen()),
                       ),
@@ -180,7 +268,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
 
-            // My Survey Section
+            // 나의 설문지
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
@@ -205,34 +293,46 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
 
-            // Reviews Section
+            // 내가 받은 후기 → 공지사항으로 이동
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-                child: const Text(
-                  '내가 받은 후기',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Color(0xFF1C1C1E)),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      '내가 받은 후기',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Color(0xFF1C1C1E)),
+                    ),
+                    TextButton(
+                      onPressed: () => Get.to(() => const NoticesScreen()),
+                      child: const Text('공지사항 보기'),
+                    ),
+                  ],
                 ),
               ),
             ),
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 24),
-                child: Container(
-                  padding: const EdgeInsets.all(24),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(20),
-                    boxShadow: [BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4))],
-                  ),
-                  child: Column(
-                    children: [
-                      Icon(Icons.rate_review_outlined, size: 48, color: Colors.grey.shade300),
-                      const SizedBox(height: 12),
-                      const Text('아직 받은 후기가 없습니다', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFF9CA3AF))),
-                      const SizedBox(height: 4),
-                      const Text('매칭 후 후기를 남겨보세요', style: TextStyle(fontSize: 13, color: Color(0xFFB0B5BD))),
-                    ],
+                child: GestureDetector(
+                  onTap: () => Get.to(() => const NoticesScreen()),
+                  child: Container(
+                    padding: const EdgeInsets.all(24),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4))],
+                    ),
+                    child: const Column(
+                      children: [
+                        Icon(Icons.campaign_outlined, size: 48, color: Color(0xFF9CA3AF)),
+                        SizedBox(height: 12),
+                        Text('공지사항 확인하기', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFF6B7280))),
+                        SizedBox(height: 4),
+                        Text('앱 업데이트 및 안내사항을 확인하세요', style: TextStyle(fontSize: 13, color: Color(0xFFB0B5BD))),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -289,22 +389,22 @@ class _HomeScreenState extends State<HomeScreen> {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+        padding: const EdgeInsets.symmetric(vertical: 22),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(20),
           boxShadow: [BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4))],
         ),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
           children: [
             Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(14)),
-              child: Icon(icon, color: color, size: 28),
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(16)),
+              child: Icon(icon, color: color, size: 26),
             ),
             const SizedBox(height: 10),
-            Text(label, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFF1C1C1E))),
+            Text(label, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
           ],
         ),
       ),
@@ -317,29 +417,25 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
-          color: const Color(0xFFFFFBEB),
+          color: const Color(0xFFFEF3C7),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: const Color(0xFFFEF3C7)),
+          border: Border.all(color: const Color(0xFFFCD34D)),
         ),
         child: Row(
           children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: const Color(0xFFFEF3C7), borderRadius: BorderRadius.circular(12)),
-              child: const Icon(Icons.add_circle_outline, color: Color(0xFFD97706), size: 24),
-            ),
+            const Icon(Icons.pending_actions_rounded, color: Color(0xFFD97706), size: 28),
             const SizedBox(width: 14),
-            Expanded(
+            const Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('설문지 추가하기', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Color(0xFF92400E))),
-                  const SizedBox(height: 2),
-                  Text('나의 생활 습관을 입력하고 매칭을 시작하세요', style: TextStyle(fontSize: 13, color: const Color(0xFFD97706).withValues(alpha: 0.8))),
+                  Text('설문지를 아직 작성하지 않으셨어요', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Color(0xFF92400E))),
+                  SizedBox(height: 4),
+                  Text('클릭하여 지금 작성해보세요', style: TextStyle(fontSize: 13, color: Color(0xFFB45309))),
                 ],
               ),
             ),
-            const Icon(Icons.arrow_forward_ios, color: Color(0xFFD97706), size: 14),
+            const Icon(Icons.arrow_forward_ios, size: 14, color: Color(0xFFD97706)),
           ],
         ),
       ),
@@ -347,36 +443,29 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _surveyCompletedCard() {
-    return GestureDetector(
-      onTap: () => Get.to(() => const SurveyScreen()),
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4))],
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: const Color(0xFFDCFCE7), borderRadius: BorderRadius.circular(12)),
-              child: const Icon(Icons.check_circle, color: Color(0xFF16A34A), size: 24),
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4))],
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.fact_check_rounded, color: Color(0xFF059669), size: 28),
+          SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('설문조사 완료!', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+                SizedBox(height: 4),
+                Text('설문 내용은 언제든 수정할 수 있어요', style: TextStyle(fontSize: 13, color: Color(0xFF6B7280))),
+              ],
             ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('설문조사 완료', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Color(0xFF166534))),
-                  const SizedBox(height: 2),
-                  const Text('내 유형 보기 / 수정하기', style: TextStyle(fontSize: 13, color: Color(0xFF6B7280))),
-                ],
-              ),
-            ),
-            const Icon(Icons.arrow_forward_ios, color: Color(0xFF9CA3AF), size: 14),
-          ],
-        ),
+          ),
+          Icon(Icons.check_circle, color: Color(0xFF059669), size: 22),
+        ],
       ),
     );
   }

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import '../controllers/auth_controller.dart';
-import 'home_screen.dart';
+import 'main_screen.dart';
 import 'login_screen.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -32,7 +32,7 @@ class _SplashScreenState extends State<SplashScreen>
 
     Future.delayed(const Duration(milliseconds: 1600), () async {
       final ok = await Get.find<AuthController>().checkAuth();
-      Get.offAll(() => ok ? const HomeScreen() : const LoginScreen());
+      Get.offAll(() => ok ? const MainScreen() : const LoginScreen());
     });
   }
 
@@ -73,7 +73,7 @@ class _SplashScreenState extends State<SplashScreen>
                 ),
                 const SizedBox(height: 28),
                 const Text(
-                  'Dorm Match',
+                  'Roomantic',
                   style: TextStyle(
                     fontSize: 28,
                     fontWeight: FontWeight.w700,

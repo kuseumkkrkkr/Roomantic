@@ -1,27 +1,34 @@
 """JWT authentication helpers."""
 
+import hashlib
+import secrets
 import datetime
 from functools import wraps
 
 import jwt
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask import request, jsonify, current_app
+from flask import request, jsonify
 
-SECRET_KEY = "dorm-match-secret-key-change-in-production"
+SECRET_KEY = "roomantic-secret-key-change-in-production"
 ALGORITHM = "HS256"
 
 
 def hash_password(password: str) -> str:
-    return generate_password_hash(password)
+    """SHA-256 단방향 해싱 (salted)."""
+    salt = secrets.token_hex(16)
+    return f"{salt}${hashlib.sha256((password + salt).encode()).hexdigest()}"
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return check_password_hash(password_hash, password)
+    if "$" not in password_hash:
+        return False
+    salt, stored = password_hash.split("$", 1)
+    return hashlib.sha256((password + salt).encode()).hexdigest() == stored
 
 
-def create_token(user_uid: str, student_id: str, name: str) -> str:
+def create_token(user_uid: str, login_id: str, name: str, student_id: str = "") -> str:
     payload = {
         "user_uid": user_uid,
+        "login_id": login_id,
         "student_id": student_id,
         "name": name,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7),

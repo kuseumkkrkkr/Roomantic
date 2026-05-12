@@ -55,7 +55,7 @@ class _MatchScreenState extends State<MatchScreen> with SingleTickerProviderStat
               unselectedLabelStyle: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14),
               dividerHeight: 0,
               tabs: const [
-                Tab(text: '내 매칭'),
+                Tab(text: '의 매칭'),
                 Tab(text: '전체 최적'),
               ],
             ),
@@ -101,8 +101,8 @@ class _MatchScreenState extends State<MatchScreen> with SingleTickerProviderStat
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder: (_, i) {
         final p = pairs[i];
-        final a = p['A'] ?? {};
-        final b = p['B'] ?? {};
+        final a = p['profile_a'] ?? {};
+        final b = p['profile_b'] ?? {};
         return Container(
           decoration: BoxDecoration(
             color: Colors.white,
@@ -139,9 +139,10 @@ class _MatchScreenState extends State<MatchScreen> with SingleTickerProviderStat
   Widget _matchCard(Map<String, dynamic> m, {required bool isTopMatch}) {
     final score = (m['score'] as num?)?.toDouble() ?? 0;
     final block = m['hard_block'] == true || m['hard_block'] == 1;
-    final name = m['name']?.toString() ?? '이름 없음';
-    final dept = m['department']?.toString() ?? m['college']?.toString() ?? '';
-    final year = m['birth_year']?.toString() ?? '';
+    final profile = m['profile_b'] ?? {};
+    final name = profile['name']?.toString() ?? '이름 없음';
+    final dept = profile['department']?.toString() ?? profile['college']?.toString() ?? '';
+    final year = profile['birth_year']?.toString() ?? '';
 
     return GestureDetector(
       onTap: () => Get.to(() => MatchDetailScreen(matchData: m)),
@@ -188,7 +189,7 @@ class _MatchScreenState extends State<MatchScreen> with SingleTickerProviderStat
                 color: _scoreBg(score),
                 borderRadius: BorderRadius.circular(14),
               ),
-              child: Text('${_fmtScore(score)} 점', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800, color: _scoreColor(score))),
+              child: Text('${_fmtScore(score)}점', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800, color: _scoreColor(score))),
             ),
           ],
         ),

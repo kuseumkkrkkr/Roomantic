@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, asdict
 from typing import List
 
-from models import RoommateProfile, profile_to_vector
+from models import RoommateProfile, profile_to_vector, classify_persona
 
 WEIGHTS = [
     1.0,  # home_visit_cycle
@@ -46,6 +46,25 @@ WEIGHTS = [
     1.5,  # friend_invite
 ]
 
+PERSONA_COMPATIBILITY = {
+    "독서실형":      {"독서실형": 1.0, "자취감성형": 0.8, "야행성게이머형": 0.1, """
+                     "FM군대형": 0.7, "생존형": 0.4, "공동체형": 0.3, "생활분리형": 0.9, "수면민감형": 0.8},
+    "자취감성형":    {"독서실형": 0.8, "자취감성형": 1.0, "야행성게이머형": 0.3, "FM군대형": 0.6, """
+                     "생존형": 0.5, "공동체형": 0.7, "생활분리형": 0.7, "수면민감형": 0.7},
+    "야행성게이머형": {"독서실형": 0.1, "자취감성형": 0.3, "야행성게이머형": 0.9, "FM군대형": 0.1, """
+                     "생존형": 0.5, "공동체형": 0.6, "생활분리형": 0.4, "수면민감형": 0.1},
+    "FM군대형":     {"독서실형": 0.7, "자취감성형": 0.6, "야행성게이머형": 0.1, "FM군대형": 0.8, """
+                     "생존형": 0.4, "공동체형": 0.6, "생활분리형": 0.8, "수면민감형": 0.6},
+    "생존형":       {"독서실형": 0.4, "자취감성형": 0.5, "야행성게이머형": 0.5, "FM군대형": 0.4, """
+                     "생존형": 0.9, "공동체형": 0.5, "생활분리형": 0.7, "수면민감형": 0.5},
+    "공동체형":     {"독서실형": 0.3, "자취감성형": 0.7, "야행성게이머형": 0.6, "FM군대형": 0.6, """
+                     "생존형": 0.5, "공동체형": 0.9, "생활분리형": 0.2, "수면민감형": 0.4},
+    "생활분리형":   {"독서실형": 0.9, "자취감성형": 0.7, "야행성게이머형": 0.4, "FM군대형": 0.8, """
+                     "생존형": 0.7, "공동체형": 0.2, "생활분리형": 1.0, "수면민감형": 0.8},
+    "수면민감형":   {"독서실형": 0.8, "자취감성형": 0.7, "야행성게이머형": 0.1, "FM군대형": 0.6, """
+                     "생존형": 0.5, "공동체형": 0.4, "생활분리형": 0.8, "수면민감형": 1.0},
+}
+
 
 @dataclass
 class MatchResult:
@@ -86,6 +105,13 @@ def _hard_filters(a: RoommateProfile, b: RoommateProfile) -> list[str]:
     return reasons
 
 
+def _persona_bonus(a: RoommateProfile, b: RoommateProfile) -> float:
+    pa = a.persona or classify_persona(a)
+    pb = b.persona or classify_persona(b)
+    compat = PERSONA_COMPATIBILITY.get(pa, {}).get(pb, 0.5)
+    return compat
+
+
 def _category_score(va: list[float], vb: list[float]) -> dict[str, float]:
     slices = {
         "향/음주/게임": (0, 9),
@@ -114,6 +140,12 @@ def match(a: RoommateProfile, b: RoommateProfile) -> MatchResult:
     block_reasons = _hard_filters(a, b)
     if block_reasons:
         score = max(0.0, score - 30)
+
+    # 페르소나 궁합 점수 반영 (최대 ±10점)
+    compat = _persona_bonus(a, b)
+    compat_adj = (compat - 0.5) * 20
+    score = min(100.0, max(0.0, score + compat_adj))
+
     detail = _category_score(va, vb)
 
     return MatchResult(

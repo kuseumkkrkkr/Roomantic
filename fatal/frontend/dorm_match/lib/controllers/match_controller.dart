@@ -11,9 +11,9 @@ class MatchController extends GetxController {
     isLoading.value = true;
     try {
       final res = await _api.getTopMatches();
-      topMatches.assignAll(List<Map<String, dynamic>>.from(res.data));
+      topMatches.assignAll(List<Map<String, dynamic>>.from(res['matches'] ?? []));
     } catch (e) {
-      Get.snackbar('오류', '매칭 결과를 불러올 수 없습니다: $e');
+      Get.snackbar('오류', '매칭 결과를 불러오지 못했습니다: $e');
     } finally {
       isLoading.value = false;
     }
@@ -23,9 +23,9 @@ class MatchController extends GetxController {
     isLoading.value = true;
     try {
       final res = await _api.getPairs();
-      pairs.assignAll(List<Map<String, dynamic>>.from(res.data));
+      pairs.assignAll(List<Map<String, dynamic>>.from(res));
     } catch (e) {
-      Get.snackbar('오류', '페어링 결과를 불러올 수 없습니다: $e');
+      Get.snackbar('오류', '페어 결과를 불러오지 못했습니다: $e');
     } finally {
       isLoading.value = false;
     }

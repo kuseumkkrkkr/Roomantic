@@ -1,47 +1,50 @@
 import 'package:get/get.dart';
-import 'package:dio/dio.dart';
-import '../services/api_service.dart';
 import '../models/profile.dart';
+import '../services/api_service.dart';
 
 class ProfileController extends GetxController {
-  final ApiService _api = ApiService();
-  final Rx<Profile?> profile = Rx<Profile?>(null);
+  final ApiService _api = Get.find<ApiService>();
+  final Rxn<Profile> profile = Rxn<Profile>();
+  final RxString persona = ''.obs;
   final RxBool isLoading = false.obs;
-  final RxString error = ''.obs;
 
-  Future<bool> fetchProfile() async {
+  @override
+  void onInit() {
+    super.onInit();
+    fetchProfile();
+  }
+
+  Future<void> fetchProfile() async {
     isLoading.value = true;
-    error.value = '';
     try {
-      final res = await _api.getProfile();
-      if (res.statusCode == 200) {
-        profile.value = Profile.fromJson(res.data);
-        return true;
-      }
-    } on DioException catch (e) {
-      if (e.response?.statusCode == 404) {
-        error.value = '설문조사를 먼저 작성해주세요.';
+      final data = await _api.getProfile();
+      if (data.containsKey('error')) {
+        profile.value = null;
+        persona.value = '';
       } else {
-        error.value = e.response?.data?['error'] ?? '프로필 조회 실패';
+        profile.value = Profile.fromJson(data);
+        persona.value = data['persona'] ?? '';
       }
+    } catch (_) {
+      profile.value = null;
+      persona.value = '';
     } finally {
       isLoading.value = false;
     }
-    return false;
   }
 
   Future<String?> saveProfile(Profile p) async {
     isLoading.value = true;
-    error.value = '';
     try {
-      final res = await _api.saveProfile(p.toJson());
-      if (res.statusCode == 200) {
-        profile.value = Profile.fromJson(res.data);
-        return null;
-      }
-      return '저장 실패';
-    } on DioException catch (e) {
-      return e.response?.data?['error'] ?? '저장 중 오류 발생';
+      await _api.saveProfile(p.toJson());
+      profile.value = p;
+      final personaData = await _api.getPersona();
+      persona.value = personaData['persona'] ?? '';
+      return null;
+    } on ApiException catch (e) {
+      return e.message;
+    } catch (e) {
+      return e.toString();
     } finally {
       isLoading.value = false;
     }

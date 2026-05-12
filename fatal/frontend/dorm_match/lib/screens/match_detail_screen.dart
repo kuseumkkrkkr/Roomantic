@@ -11,9 +11,11 @@ class MatchDetailScreen extends StatelessWidget {
     final block = matchData['hard_block'] == true || matchData['hard_block'] == 1;
     final reasons = List<String>.from(matchData['block_reasons'] ?? []);
     final detail = matchData['detail'] ?? {};
-    final categories = detail['categories'] ?? {};
-    final diffRaw = detail['diff'];
-    final diff = diffRaw is Map ? diffRaw : <String, dynamic>{};
+    // detail is a flat map: {"카테고리명": score, ...}
+    final categories = detail is Map<String, dynamic> ? detail : <String, dynamic>{};
+    final diff = <String, dynamic>{};
+
+    final profile = matchData['profile_b'] ?? {};
 
     return Scaffold(
       appBar: AppBar(
@@ -38,7 +40,7 @@ class MatchDetailScreen extends StatelessWidget {
                 child: Column(
                   children: [
                     Text(
-                      matchData['name']?.toString() ?? '상대방',
+                      profile['name']?.toString() ?? '이름 없음',
                       style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
                     ),
                     const SizedBox(height: 18),
@@ -97,7 +99,8 @@ class MatchDetailScreen extends StatelessWidget {
             const SizedBox(height: 10),
             ...categories.entries.map<Widget>((entry) {
               final name = entry.key.toString();
-              final cat = entry.value is Map<String, dynamic> ? entry.value as Map<String, dynamic> : <String, dynamic>{};
+              final scoreValue = entry.value;
+              final cat = scoreValue is num ? <String, dynamic>{'score': scoreValue} : <String, dynamic>{};
               return _buildCategory(name, cat, diff[name]);
             }),
           ],
@@ -106,8 +109,8 @@ class MatchDetailScreen extends StatelessWidget {
     );
   }
 
-  Widget? _buildCategory(String name, Map<String, dynamic> cat, dynamic diffEntry) {
-    if (cat['score'] == null) return null;
+  Widget _buildCategory(String name, Map<String, dynamic> cat, dynamic diffEntry) {
+    if (cat['score'] == null) return const SizedBox.shrink();
 
     final score = (cat['score'] as num).toDouble();
     final Color colors = _catScoreColor(score);

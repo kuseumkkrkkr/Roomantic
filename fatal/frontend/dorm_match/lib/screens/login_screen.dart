@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import '../controllers/auth_controller.dart';
-import 'home_screen.dart';
-import 'register_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -12,15 +10,15 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _studentId = TextEditingController();
+  final _loginId = TextEditingController();
   final _password = TextEditingController();
   final _auth = Get.find<AuthController>();
 
   void _login() async {
     FocusScope.of(context).unfocus();
-    final error = await _auth.login(_studentId.text.trim(), _password.text);
+    final error = await _auth.login(_loginId.text.trim(), _password.text);
     if (error == null) {
-      Get.offAll(() => const HomeScreen());
+      Get.offAllNamed('/home');
     } else {
       Get.snackbar(
         '로그인 실패',
@@ -56,7 +54,7 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
               const SizedBox(height: 8),
               const Text(
-                '학번으로 로그인하고\n나와 꼭 맞는 룸메이트를 찾아보세요.',
+                '아이디로 로그인하고\n나와 꼭 맞는 룸메이트를 찾아보세요',
                 style: TextStyle(
                   fontSize: 16,
                   height: 1.5,
@@ -64,7 +62,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
               ),
               const SizedBox(height: 48),
-              _buildTextField('학번', _studentId, TextInputType.number),
+              _buildTextField('아이디', _loginId, TextInputType.text),
               const SizedBox(height: 16),
               _buildTextField('비밀번호', _password, TextInputType.text, obscure: true),
               const SizedBox(height: 32),
@@ -87,7 +85,7 @@ class _LoginScreenState extends State<LoginScreen> {
               const SizedBox(height: 20),
               Center(
                 child: TextButton(
-                  onPressed: () => Get.to(() => const RegisterScreen()),
+                  onPressed: () => Get.toNamed('/register'),
                   child: RichText(
                     text: const TextSpan(
                       text: '계정이 없으신가요?  ',
@@ -126,7 +124,7 @@ class _LoginScreenState extends State<LoginScreen> {
       decoration: InputDecoration(
         labelText: label,
         prefixIcon: Icon(
-          label == '학번' ? Icons.badge_outlined : Icons.lock_outline,
+          label == '아이디' ? Icons.person_outline : Icons.lock_outline,
           color: const Color(0xFF9CA3AF),
         ),
       ),

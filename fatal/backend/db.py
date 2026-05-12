@@ -1,17 +1,21 @@
-"""SQLite helpers for roommate backend."""
+"""Simple SQLite helpers."""
 
 import sqlite3
-from typing import Optional
-
-from models import User, RoommateProfile
+from typing import List, Optional
+from models import User, RoommateProfile, profile_to_dict, classify_persona
 
 DB_PATH = "roommates_api.db"
 
+
 USER_COLUMNS = [
     ("uid", "TEXT PRIMARY KEY"),
-    ("student_id", "TEXT NOT NULL UNIQUE"),
+    ("login_id", "TEXT NOT NULL UNIQUE"),
+    ("student_id", "TEXT"),
     ("password_hash", "TEXT NOT NULL"),
     ("name", "TEXT NOT NULL"),
+    ("is_enrolled", "INTEGER NOT NULL DEFAULT 1"),
+    ("school_name", "TEXT"),
+    ("region_name", "TEXT"),
 ]
 
 PROFILE_COLUMNS = [
@@ -64,83 +68,171 @@ PROFILE_COLUMNS = [
 ]
 
 
-def init_db(db_path: str = DB_PATH) -> None:
+def _ensure_table(conn: sqlite3.Connection, name: str, columns: List):
+    col_defs = ", ".join(f"{c} {t}" for c, t in columns)
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({col_defs})")
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: List):
+    """Best-effort migration: add columns if they do not exist."""
+    existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for col_name, col_type in columns:
+        if col_name not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
+
+def init_db(db_path: str = DB_PATH, drop_if_corrupt: bool = True):
+    try:
+        conn = sqlite3.connect(db_path)
+        _ensure_table(conn, "users", USER_COLUMNS)
+        _ensure_table(conn, "profiles", PROFILE_COLUMNS)
+        _add_missing_columns(conn, "users", USER_COLUMNS)
+        _add_missing_columns(conn, "profiles", PROFILE_COLUMNS)
+
+        # 새 테이블: pairings (전체 매칭 결과)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pairings (uid TEXT PRIMARY KEY, pair_json TEXT, generated_at TEXT)"
+        )
+
+        # 새 테이블: match_requests (요청/승인)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS match_requests ("
+            "          uid TEXT PRIMARY KEY, from_user TEXT, to_user TEXT, status TEXT, created_at TEXT, updated_at TEXT)"
+        )
+
+        # 새 테이블: chat_messages
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chat_messages ("
+            "          uid TEXT PRIMARY KEY, sender TEXT, receiver TEXT, content TEXT, type TEXT, read INTEGER, created_at TEXT)"
+        )
+
+        # 새 테이블: reviews
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS reviews ("
+            "          uid TEXT PRIMARY KEY, reviewer TEXT, reviewee TEXT, rating REAL, body TEXT, created_at TEXT)"
+        )
+
+        # 새 테이블: match_history
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS match_history ("
+            "          uid TEXT PRIMARY KEY, user_a TEXT, user_b TEXT, status TEXT, matched_at TEXT)"
+        )
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        if drop_if_corrupt:
+            import os
+            if os.path.exists(db_path):
+                os.remove(db_path)
+            conn = sqlite3.connect(db_path)
+            _ensure_table(conn, "users", USER_COLUMNS)
+            _ensure_table(conn, "profiles", PROFILE_COLUMNS)
+            _add_missing_columns(conn, "users", USER_COLUMNS)
+            _add_missing_columns(conn, "profiles", PROFILE_COLUMNS)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pairings (uid TEXT PRIMARY KEY, pair_json TEXT, generated_at TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS match_requests ("
+                "          uid TEXT PRIMARY KEY, from_user TEXT, to_user TEXT, status TEXT, created_at TEXT, updated_at TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS chat_messages ("
+                "          uid TEXT PRIMARY KEY, sender TEXT, receiver TEXT, content TEXT, type TEXT, read INTEGER, created_at TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reviews ("
+                "          uid TEXT PRIMARY KEY, reviewer TEXT, reviewee TEXT, rating REAL, body TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS match_history ("
+                "          uid TEXT PRIMARY KEY, user_a TEXT, user_b TEXT, status TEXT, matched_at TEXT)"
+            )
+            conn.commit()
+            conn.close()
+        else:
+            raise
+
+
+def save_user(user: User, db_path: str = DB_PATH):
     conn = sqlite3.connect(db_path)
-    user_sql = ", ".join([f"{name} {ctype}" for name, ctype in USER_COLUMNS])
-    conn.execute(f"CREATE TABLE IF NOT EXISTS users ({user_sql})")
-    prof_sql = ", ".join([f"{name} {ctype}" for name, ctype in PROFILE_COLUMNS])
-    conn.execute(f"CREATE TABLE IF NOT EXISTS profiles ({prof_sql})")
+    conn.execute(
+        "INSERT OR REPLACE INTO users (uid, login_id, student_id, password_hash, name, is_enrolled, school_name, region_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user.uid, user.login_id, user.student_id, user.password_hash, user.name, user.is_enrolled, user.school_name, user.region_name),
+    )
     conn.commit()
     conn.close()
 
 
-def save_user(user: User, db_path: str = DB_PATH) -> None:
-    init_db(db_path)
+def get_user_by_login_id(login_id: str, db_path: str = DB_PATH) -> Optional[User]:
     conn = sqlite3.connect(db_path)
-    cols = ", ".join([c[0] for c in USER_COLUMNS])
-    placeholders = ", ".join(["?"] * len(USER_COLUMNS))
-    sql = f"INSERT OR REPLACE INTO users ({cols}) VALUES ({placeholders})"
-    d = user.__dict__
-    conn.execute(sql, tuple(d[c[0]] for c in USER_COLUMNS))
-    conn.commit()
-    conn.close()
-
-
-def get_user_by_student_id(student_id: str, db_path: str = DB_PATH) -> Optional[User]:
-    init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    cols = [c[0] for c in USER_COLUMNS]
-    row = conn.execute(
-        f"SELECT {', '.join(cols)} FROM users WHERE student_id = ?", (student_id,)
-    ).fetchone()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE login_id = ? LIMIT 1", (login_id,)).fetchone()
     conn.close()
     if row is None:
         return None
-    return User(**dict(zip(cols, row)))
+    return User(**{k: row[k] for k in row.keys()})
 
 
 def get_user_by_uid(uid: str, db_path: str = DB_PATH) -> Optional[User]:
-    init_db(db_path)
     conn = sqlite3.connect(db_path)
-    cols = [c[0] for c in USER_COLUMNS]
-    row = conn.execute(
-        f"SELECT {', '.join(cols)} FROM users WHERE uid = ?", (uid,)
-    ).fetchone()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE uid = ? LIMIT 1", (uid,)).fetchone()
     conn.close()
     if row is None:
         return None
-    return User(**dict(zip(cols, row)))
+    return User(**{k: row[k] for k in row.keys()})
 
 
-def save_profile(profile: RoommateProfile, db_path: str = DB_PATH) -> None:
-    init_db(db_path)
+def save_profile(profile: RoommateProfile, db_path: str = DB_PATH):
+    # 페르소나 자동 분류
+    if not profile.persona:
+        profile.persona = classify_persona(profile)
+
     conn = sqlite3.connect(db_path)
-    placeholders = ", ".join(["?"] * len(PROFILE_COLUMNS))
-    cols = ", ".join([c[0] for c in PROFILE_COLUMNS])
-    sql = f"INSERT OR REPLACE INTO profiles ({cols}) VALUES ({placeholders})"
-    d = profile.__dict__
-    conn.execute(sql, tuple(d[c[0]] for c in PROFILE_COLUMNS))
+    cols = [c for c, _ in PROFILE_COLUMNS]
+    placeholders = ", ".join(["?"] * len(cols))
+    values = [getattr(profile, c, None) for c in cols]
+    conn.execute(
+        f"INSERT OR REPLACE INTO profiles ({', '.join(cols)}) VALUES ({placeholders})",
+        values,
+    )
     conn.commit()
     conn.close()
 
 
 def get_profile_by_user_uid(user_uid: str, db_path: str = DB_PATH) -> Optional[RoommateProfile]:
-    init_db(db_path)
     conn = sqlite3.connect(db_path)
-    cols = [c[0] for c in PROFILE_COLUMNS]
+    conn.row_factory = sqlite3.Row
     row = conn.execute(
-        f"SELECT {', '.join(cols)} FROM profiles WHERE user_uid = ?", (user_uid,)
+        "SELECT * FROM profiles WHERE user_uid = ? LIMIT 1", (user_uid,)
     ).fetchone()
     conn.close()
     if row is None:
         return None
-    return RoommateProfile(**dict(zip(cols, row)))
+    return RoommateProfile(**{k: row[k] for k in row.keys()})
 
 
-def fetch_profiles(db_path: str = DB_PATH) -> list[RoommateProfile]:
-    init_db(db_path)
+def fetch_profiles(db_path: str = DB_PATH) -> List[RoommateProfile]:
     conn = sqlite3.connect(db_path)
-    cols = [c[0] for c in PROFILE_COLUMNS]
-    rows = conn.execute(f"SELECT {', '.join(cols)} FROM profiles").fetchall()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM profiles").fetchall()
     conn.close()
-    return [RoommateProfile(**dict(zip(cols, row))) for row in rows]
+    return [RoommateProfile(**{k: r[k] for k in r.keys()}) for r in rows]
+
+
+# --- 기존 student_id 기반 조회 유지 호환 ---
+
+def get_user_by_student_id(student_id: str, db_path: str = DB_PATH) -> Optional[User]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE student_id = ? LIMIT 1", (student_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return User(**{k: row[k] for k in row.keys()})
