@@ -1,30 +1,61 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:get/get.dart';
 
-import 'package:roomantic/main.dart';
+import 'package:roomantic/controllers/match_controller.dart';
+import 'package:roomantic/screens/match_screen.dart';
+import 'package:roomantic/utils/match_ui_helper.dart';
+import 'package:flutter/material.dart';
+
+class FakeMatchController extends MatchController {
+  @override
+  void onInit() {}
+
+  @override
+  void onClose() {}
+}
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  setUp(() {
+    Get.testMode = true;
+    Get.reset();
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  tearDown(Get.reset);
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+  test('grade mapping follows score thresholds', () {
+    expect(MatchUiHelper.gradeFromScore(90).label, '매우 잘 맞음');
+    expect(MatchUiHelper.gradeFromScore(80).label, '잘 맞음');
+    expect(MatchUiHelper.gradeFromScore(70).label, '조율 필요');
+    expect(MatchUiHelper.gradeFromScore(50).label, '신중 검토');
+  });
+
+  test('summary fallback is safe when detail is missing', () {
+    final summary = MatchUiHelper.summaryFrom({
+      'candidate_type': 'individual',
+      'score': 72.3,
+    });
+    expect(summary.subtitle, '일치율 72.3%');
+    expect(summary.strengths.isNotEmpty, isTrue);
+    expect(summary.cautions.isNotEmpty, isTrue);
+  });
+
+  testWidgets('match card exposes profile-first action', (tester) async {
+    final ctrl = Get.put<MatchController>(FakeMatchController());
+    ctrl.poolCandidates.assignAll([
+      {
+        'candidate_type': 'individual',
+        'score': 81.2,
+        'detail': {'sleep': 88, 'clean': 90, 'noise': 63},
+        'profile': {'name': '김테현', 'user_uid': 'u-1'},
+        'member_names': ['김테현'],
+        'member_scores': [81.2],
+      },
+    ]);
+
+    await tester.pumpWidget(const GetMaterialApp(home: MatchScreen()));
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('프로필 보기'), findsOneWidget);
+    expect(find.text('채팅 시작'), findsNothing);
   });
 }

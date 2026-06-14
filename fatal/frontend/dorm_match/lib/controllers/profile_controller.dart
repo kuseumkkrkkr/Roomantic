@@ -18,7 +18,8 @@ class ProfileController extends GetxController {
     isLoading.value = true;
     try {
       final data = await _api.getProfile();
-      if (data.containsKey('error')) {
+      final exists = data['exists'];
+      if (exists == false || data.containsKey('error')) {
         profile.value = null;
         persona.value = '';
       } else {

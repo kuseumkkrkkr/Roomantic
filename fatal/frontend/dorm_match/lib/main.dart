@@ -4,10 +4,14 @@ import 'screens/splash_screen.dart';
 import 'screens/main_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
+import 'screens/admin_dashboard_screen.dart';
+import 'screens/matching_split_screen.dart';
 import 'controllers/auth_controller.dart';
+import 'controllers/match_controller.dart';
 
 void main() {
   Get.put(AuthController());
+  Get.lazyPut<MatchController>(() => MatchController(), fenix: true);
   runApp(const MyApp());
 }
 
@@ -52,19 +56,29 @@ class MyApp extends StatelessWidget {
             shape: const RoundedRectangleBorder(
               borderRadius: BorderRadius.all(Radius.circular(16)),
             ),
-            textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600, letterSpacing: -0.2),
+            textStyle: const TextStyle(
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+              letterSpacing: -0.2,
+            ),
           ),
         ),
         textButtonTheme: TextButtonThemeData(
           style: TextButton.styleFrom(
             foregroundColor: _primary,
-            textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+            textStyle: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w500,
+            ),
           ),
         ),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
           fillColor: _surface,
-          contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 18,
+            vertical: 18,
+          ),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
             borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
@@ -85,7 +99,12 @@ class MyApp extends StatelessWidget {
           elevation: 0,
           centerTitle: true,
           scrolledUnderElevation: 0,
-          titleTextStyle: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: _onSurface, letterSpacing: -0.3),
+          titleTextStyle: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: _onSurface,
+            letterSpacing: -0.3,
+          ),
           iconTheme: IconThemeData(color: _onSurface),
         ),
         bottomNavigationBarTheme: const BottomNavigationBarThemeData(
@@ -94,8 +113,14 @@ class MyApp extends StatelessWidget {
           unselectedItemColor: Color(0xFF9CA3AF),
           type: BottomNavigationBarType.fixed,
           elevation: 0,
-          selectedLabelStyle: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
-          unselectedLabelStyle: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
+          selectedLabelStyle: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w500,
+          ),
+          unselectedLabelStyle: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w500,
+          ),
         ),
         tabBarTheme: const TabBarThemeData(
           dividerColor: Colors.transparent,
@@ -103,7 +128,10 @@ class MyApp extends StatelessWidget {
           unselectedLabelColor: Color(0xFF9CA3AF),
           indicatorSize: TabBarIndicatorSize.tab,
           labelStyle: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          unselectedLabelStyle: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+          unselectedLabelStyle: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w500,
+          ),
         ),
         sliderTheme: const SliderThemeData(
           activeTrackColor: _primary,
@@ -113,10 +141,15 @@ class MyApp extends StatelessWidget {
           trackHeight: 4,
         ),
         switchTheme: SwitchThemeData(
-          thumbColor: WidgetStateProperty.resolveWith((states) =>
-              states.contains(WidgetState.selected) ? _primary : Colors.white),
-          trackColor: WidgetStateProperty.resolveWith((states) =>
-              states.contains(WidgetState.selected) ? const Color(0xFF2563EB).withValues(alpha: 0.3) : const Color(0xFFE5E7EB)),
+          thumbColor: WidgetStateProperty.resolveWith(
+            (states) =>
+                states.contains(WidgetState.selected) ? _primary : Colors.white,
+          ),
+          trackColor: WidgetStateProperty.resolveWith(
+            (states) => states.contains(WidgetState.selected)
+                ? const Color(0xFF2563EB).withValues(alpha: 0.3)
+                : const Color(0xFFE5E7EB),
+          ),
           trackOutlineColor: WidgetStateProperty.all(Colors.transparent),
         ),
       ),
@@ -126,6 +159,11 @@ class MyApp extends StatelessWidget {
         GetPage(name: '/login', page: () => const LoginScreen()),
         GetPage(name: '/register', page: () => const RegisterScreen()),
         GetPage(name: '/home', page: () => const MainScreen()),
+        GetPage(name: '/admin', page: () => const AdminDashboardScreen()),
+        GetPage(
+          name: '/matching-split',
+          page: () => const MatchingSplitScreen(),
+        ),
       ],
     );
   }

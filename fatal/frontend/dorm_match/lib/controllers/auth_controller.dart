@@ -52,25 +52,32 @@ class AuthController extends GetxController {
     required String loginId,
     required String password,
     required String name,
+    required int birthYear,
     String studentId = '',
     bool isEnrolled = true,
     String schoolName = '',
+    String college = '',
+    String department = '',
     String regionName = '',
+    String gender = '',
   }) async {
     isLoading.value = true;
     try {
       // SHA-256 단방향 암호화: 비밀번호 및 학번 (민감 정보)
       final hashedPassword = _sha256(password.trim());
-      final hashedStudentId = studentId.trim().isNotEmpty ? _sha256(studentId.trim()) : '';
 
       final data = await _api.register({
         'login_id': loginId.trim(),
         'password': hashedPassword,
         'name': name.trim(),
-        'student_id': hashedStudentId,
+        'birth_year': birthYear,
+        'student_id': studentId.trim(),
         'is_enrolled': isEnrolled ? 1 : 0,
         'school_name': schoolName.trim(),
+        'college': college.trim(),
+        'department': department.trim(),
         'region_name': regionName.trim(),
+        'gender': gender.trim(),
       });
       user.value = User.fromJson(data['user']);
       await _api.setToken(data['token']);

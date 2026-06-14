@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+
+import 'chat_threads_screen.dart';
 import 'home_screen.dart';
-import 'match_screen.dart';
+import 'match_history_screen.dart';
 import 'profile_screen.dart';
 
 class MainScreen extends StatefulWidget {
@@ -15,17 +17,15 @@ class _MainScreenState extends State<MainScreen> {
 
   final List<Widget> _pages = const [
     HomeScreen(),
+    ChatThreadsScreen(),
+    MatchHistoryScreen(),
     ProfileScreen(),
-    MatchScreen(),
   ];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _pages,
-      ),
+      body: IndexedStack(index: _currentIndex, children: _pages),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
         onTap: (index) => setState(() => _currentIndex = index),
@@ -34,8 +34,18 @@ class _MainScreenState extends State<MainScreen> {
         unselectedItemColor: const Color(0xFF9CA3AF),
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: '홈'),
-          BottomNavigationBarItem(icon: Icon(Icons.person_rounded), label: '프로필'),
-          BottomNavigationBarItem(icon: Icon(Icons.favorite_rounded), label: '매칭'),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.chat_bubble_outline),
+            label: '채팅',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.favorite_rounded),
+            label: '매칭',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.person_rounded),
+            label: '프로필',
+          ),
         ],
       ),
     );

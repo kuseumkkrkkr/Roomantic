@@ -1,4 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
+
+import '../controllers/match_controller.dart';
+import '../utils/match_ui_helper.dart';
+import 'chat_threads_screen.dart';
 
 class MatchDetailScreen extends StatelessWidget {
   final Map<String, dynamic> matchData;
@@ -7,209 +12,257 @@ class MatchDetailScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final score = (matchData['score'] as num?)?.toDouble() ?? 0.0;
-    final block = matchData['hard_block'] == true || matchData['hard_block'] == 1;
-    final reasons = List<String>.from(matchData['block_reasons'] ?? []);
-    final detail = matchData['detail'] ?? {};
-    // detail is a flat map: {"카테고리명": score, ...}
-    final categories = detail is Map<String, dynamic> ? detail : <String, dynamic>{};
-    final diff = <String, dynamic>{};
+    final ctrl = Get.find<MatchController>();
+    final score = MatchUiHelper.scoreFrom(matchData);
+    final isRoom =
+        (matchData['candidate_type']?.toString() ?? 'individual') == 'room';
+    final summary = MatchUiHelper.summaryFrom(matchData);
 
-    final profile = matchData['profile_b'] ?? {};
+    final profile = (matchData['profile'] is Map<String, dynamic>)
+        ? matchData['profile'] as Map<String, dynamic>
+        : <String, dynamic>{};
+    final memberNames = List<String>.from(
+      matchData['member_names'] ?? const [],
+    );
+    final memberScores = List<double>.from(
+      (matchData['member_scores'] as List<dynamic>? ?? const []).map(
+        (e) => (e as num).toDouble(),
+      ),
+    );
+
+    final displayName = isRoom
+        ? (matchData['display_name']?.toString() ??
+              '${memberNames.join(', ')}의 방')
+        : (profile['name']?.toString() ?? '상대 사용자');
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('매칭 상세'),
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16).copyWith(bottom: 40),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Score header
-            Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 24),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(28),
-                  boxShadow: [
-                    BoxShadow(color: const Color(0x0D000000), blurRadius: 20, offset: const Offset(0, 6)),
+      appBar: AppBar(title: const Text('매칭 상세')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: isRoom
+                    ? const Color(0xFF1E3A8A)
+                    : const Color(0xFFE5E7EB),
+                width: isRoom ? 2 : 1,
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x0D000000),
+                  blurRadius: 12,
+                  offset: Offset(0, 3),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        displayName,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    _gradeChip(summary.grade),
                   ],
                 ),
-                child: Column(
-                  children: [
-                    Text(
-                      profile['name']?.toString() ?? '이름 없음',
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 18),
-                    Container(
-                      width: 120, height: 120,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: _scoreBg(score),
-                        border: Border.all(color: _scoreColor(score).withValues(alpha: 0.15), width: 6),
+                const SizedBox(height: 8),
+                Text(
+                  summary.subtitle,
+                  style: const TextStyle(
+                    color: Color(0xFF374151),
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '종합 점수 ${score.toStringAsFixed(1)}점',
+                  style: const TextStyle(
+                    color: Color(0xFF6B7280),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (isRoom && memberNames.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      '구성원: ${memberNames.join(', ')}',
+                      style: const TextStyle(
+                        color: Color(0xFF6B7280),
+                        fontWeight: FontWeight.w600,
                       ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        score.toStringAsFixed(1),
-                        style: TextStyle(fontSize: 36, fontWeight: FontWeight.w900, color: _scoreColor(score)),
+                    ),
+                  ),
+                if (isRoom && memberScores.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '개별 점수: ${memberScores.map((e) => e.toStringAsFixed(1)).join(' / ')}',
+                      style: const TextStyle(
+                        color: Color(0xFF6B7280),
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    Text('총점', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey.shade500)),
-                  ],
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _reasonCard(
+            title: '잘 맞는 점',
+            icon: Icons.thumb_up_alt_outlined,
+            bg: const Color(0xFFEFF6FF),
+            lines: summary.strengths,
+          ),
+          const SizedBox(height: 10),
+          _reasonCard(
+            title: '미리 조율할 점',
+            icon: Icons.rule_outlined,
+            bg: const Color(0xFFFFF7ED),
+            lines: summary.cautions,
+          ),
+          const SizedBox(height: 14),
+          if (ctrl.isInCooldown)
+            Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFEEF2FF),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFC7D2FE)),
+              ),
+              child: const Text(
+                '쿨다운 중에는 새 채팅을 시작할 수 없어요. 리스트에서 후보를 둘러보며 다음 매칭을 준비해보세요.',
+                style: TextStyle(
+                  color: Color(0xFF312E81),
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ),
-            const SizedBox(height: 20),
-            if (block && reasons.isNotEmpty)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFEF2F2),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFFFECACA), width: 1),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Row(
-                      children: [
-                        Icon(Icons.block, color: Color(0xFFDC2626), size: 18),
-                        SizedBox(width: 8),
-                        Text('Hard Block', style: TextStyle(fontWeight: FontWeight.w800, color: Color(0xFFDC2626))),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 6,
-                      children: reasons.map((r) => Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
-                        child: Text(r, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF991B1B))),
-                      )).toList(),
-                    ),
-                  ],
-                ),
+          ElevatedButton.icon(
+            onPressed: ctrl.isInCooldown
+                ? null
+                : () async {
+                    final candidateUids = _extractCandidateUids(matchData);
+                    if (candidateUids.isEmpty) {
+                      Get.snackbar('오류', '채팅 대상을 찾지 못했습니다.');
+                      return;
+                    }
+                    final sessionId = await ctrl.enterSession(candidateUids);
+                    if (sessionId != null) {
+                      Get.to(() => const ChatThreadsScreen());
+                    }
+                  },
+            icon: const Icon(Icons.chat_bubble_outline),
+            label: const Text('채팅 시작'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF2563EB),
+              foregroundColor: Colors.white,
+              minimumSize: const Size.fromHeight(48),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
               ),
-            const SizedBox(height: 10),
-            ...categories.entries.map<Widget>((entry) {
-              final name = entry.key.toString();
-              final scoreValue = entry.value;
-              final cat = scoreValue is num ? <String, dynamic>{'score': scoreValue} : <String, dynamic>{};
-              return _buildCategory(name, cat, diff[name]);
-            }),
-          ],
-        ),
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _buildCategory(String name, Map<String, dynamic> cat, dynamic diffEntry) {
-    if (cat['score'] == null) return const SizedBox.shrink();
-
-    final score = (cat['score'] as num).toDouble();
-    final Color colors = _catScoreColor(score);
-    final Color bg = _catScoreBg(score);
-
-    final diffs = diffEntry is Map<String, dynamic> ? diffEntry : <String, dynamic>{};
-
+  Widget _gradeChip(MatchUiGrade grade) {
     return Container(
-      margin: const EdgeInsets.only(top: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: [
-          BoxShadow(color: const Color(0x0D000000), blurRadius: 16, offset: const Offset(0, 4)),
-        ],
+        color: grade.background,
+        borderRadius: BorderRadius.circular(999),
       ),
-      padding: const EdgeInsets.all(20),
+      child: Text(
+        grade.label,
+        style: TextStyle(color: grade.foreground, fontWeight: FontWeight.w800),
+      ),
+    );
+  }
+
+  Widget _reasonCard({
+    required String title,
+    required IconData icon,
+    required Color bg,
+    required List<String> lines,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(14),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(10)),
-                child: Text('${score.toStringAsFixed(0)}점', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: colors)),
+              Icon(icon, size: 18, color: const Color(0xFF374151)),
+              const SizedBox(width: 6),
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w800,
+                  color: Color(0xFF374151),
+                ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: LinearProgressIndicator(
-              value: score / 100,
-              backgroundColor: const Color(0xFFF3F4F6),
-              valueColor: AlwaysStoppedAnimation(colors),
-              minHeight: 8,
+          const SizedBox(height: 8),
+          ...lines.map(
+            (line) => Padding(
+              padding: const EdgeInsets.only(bottom: 3),
+              child: Text(
+                '- $line',
+                style: const TextStyle(
+                  color: Color(0xFF4B5563),
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
             ),
           ),
-          if (diffs.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            ...diffs.entries.where((e) => e.value != null).map((e) {
-              final val = e.value;
-              String diffText;
-              if (val is num) {
-                diffText = val.toStringAsFixed(1);
-              } else if (val is bool || val is int) {
-                diffText = val.toString();
-              } else {
-                diffText = val.toString();
-              }
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 5, height: 5,
-                      decoration: BoxDecoration(color: colors, borderRadius: BorderRadius.circular(3)),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '${e.key}: 차이 $diffText',
-                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFF4B5563)),
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }),
-          ],
         ],
       ),
     );
   }
 
-  Color _scoreBg(double s) {
-    if (s >= 80) return const Color(0xFFF0FDF4);
-    if (s >= 60) return const Color(0xFFFFFBEB);
-    return const Color(0xFFFEF2F2);
-  }
+  List<String> _extractCandidateUids(Map<String, dynamic> data) {
+    final candidateType = data['candidate_type']?.toString() ?? 'individual';
+    if (candidateType == 'room') {
+      final uids = List<String>.from(data['candidate_uids'] ?? const []);
+      if (uids.isNotEmpty) {
+        return uids;
+      }
+      final members = List<Map<String, dynamic>>.from(
+        data['members'] ?? const [],
+      );
+      return members
+          .map((m) => (m['user_uid']?.toString() ?? '').trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
 
-  Color _scoreColor(double s) {
-    if (s >= 80) return const Color(0xFF16A34A);
-    if (s >= 60) return const Color(0xFFD97706);
-    return const Color(0xFFDC2626);
-  }
-
-  Color _catScoreColor(double s) {
-    if (s >= 80) return const Color(0xFF16A34A);
-    if (s >= 60) return const Color(0xFFF59E0B);
-    return const Color(0xFFEF4444);
-  }
-
-  Color _catScoreBg(double s) {
-    if (s >= 80) return const Color(0xFFDCFCE7);
-    if (s >= 60) return const Color(0xFFFEF3C7);
-    return const Color(0xFFFEE2E2);
+    final profile = (data['profile'] is Map<String, dynamic>)
+        ? data['profile'] as Map<String, dynamic>
+        : <String, dynamic>{};
+    final uid =
+        (profile['user_uid']?.toString() ?? data['user_uid']?.toString() ?? '')
+            .trim();
+    if (uid.isEmpty) return [];
+    return [uid];
   }
 }

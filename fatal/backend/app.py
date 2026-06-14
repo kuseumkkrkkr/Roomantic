@@ -1,22 +1,26 @@
-"""Flask backend for Roomantic roommate matching app."""
+﻿"""Flask backend for Roomantic roommate matching app."""
 
 import uuid
 import datetime
 import queue
 import sqlite3
 import threading
-from typing import Dict, Set
+import json
+import hashlib
+import random
+from typing import Dict, Set, Any
 
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template
 from flask_cors import CORS
 
 import db
 from models import User, RoommateProfile, profile_to_dict, classify_persona
-from matcher import rank_matches, best_pairings
+from matcher import rank_matches, best_pairings, match
 from auth import hash_password, verify_password, create_token, login_required
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+FORLOCAL_DB_PATH = "forlocal.db"
 
 # In-memory SSE queues: user_uid -> [queue]
 _SSE_QUEUES: Dict[str, list] = {}
@@ -55,43 +59,386 @@ def _now() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
-# ─── Auth ────────────────────────────────────────────────────────────────
+def _parse_ts(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+
+
+def _forlocal_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(FORLOCAL_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS local_chat_snapshots ("
+        "user_uid TEXT NOT NULL, "
+        "thread_uid TEXT NOT NULL, "
+        "messages_json TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, "
+        "PRIMARY KEY(user_uid, thread_uid)"
+        ")"
+    )
+    conn.commit()
+    return conn
+
+
+def _app_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_notices_table(conn: sqlite3.Connection):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notices ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "title TEXT NOT NULL, "
+        "body TEXT NOT NULL, "
+        "is_pinned INTEGER NOT NULL DEFAULT 0, "
+        "created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
+    )
+
+
+def _notice_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "body": row["body"],
+        "is_pinned": bool(row["is_pinned"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _seed_default_notices_if_empty(conn: sqlite3.Connection):
+    count = conn.execute("SELECT COUNT(*) AS c FROM notices").fetchone()["c"]
+    if int(count or 0) > 0:
+        return
+    defaults = [
+        (
+            "룸앤틱 베타 서비스 오픈",
+            "룸앤틱 베타 서비스를 시작했습니다. 성향 기반으로 기숙사 룸메이트를 찾아보세요.",
+            0,
+            "2026-05-01T00:00:00Z",
+            "2026-05-01T00:00:00Z",
+        ),
+        (
+            "설문 기능 업데이트",
+            "설문 수정과 유형 상세 비교 기능을 개선했습니다.",
+            0,
+            "2026-05-03T00:00:00Z",
+            "2026-05-03T00:00:00Z",
+        ),
+        (
+            "매칭 알고리즘 개선",
+            "성향 분석 정확도와 우선순위 기반 매칭 로직을 업데이트했습니다.",
+            0,
+            "2026-05-08T00:00:00Z",
+            "2026-05-08T00:00:00Z",
+        ),
+        (
+            "실시간 알림 기능 안내",
+            "중요 공지와 매칭 요청 알림을 실시간으로 받아볼 수 있습니다.",
+            1,
+            "2026-05-10T00:00:00Z",
+            "2026-05-10T00:00:00Z",
+        ),
+    ]
+    for title, body, pinned, created_at, updated_at in defaults:
+        conn.execute(
+            "INSERT INTO notices (title, body, is_pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (title, body, pinned, created_at, updated_at),
+        )
+    conn.commit()
+
+
+def _ensure_thread_leaves_table(conn: sqlite3.Connection):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_thread_leaves ("
+        "thread_uid TEXT NOT NULL, "
+        "user_uid TEXT NOT NULL, "
+        "left_at TEXT NOT NULL, "
+        "PRIMARY KEY(thread_uid, user_uid)"
+        ")"
+    )
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _tier_from_score(score: float) -> str:
+    if score >= 90:
+        return "90-100"
+    if score >= 80:
+        return "80-90"
+    if score >= 70:
+        return "70-80"
+    if score >= 60:
+        return "60-80"
+    return "under-70"
+
+
+def _to_date(value: str | None) -> datetime.date | None:
+    if not value:
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _get_school_row(school_name: str):
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM schools WHERE name=?", (school_name,)).fetchone()
+    conn.close()
+    return row
+
+
+def _school_matching_phase(school_row, today: datetime.date | None = None) -> str:
+    if not school_row:
+        return "closed"
+    if int(school_row["matching_enabled"] or 0) != 1:
+        return "closed"
+    # Admin explicitly started matching: if schedule is missing, keep it open.
+    target_day = _to_date(school_row["recruitment_end"]) or _to_date(school_row["recruitment_start"])
+    if not target_day:
+        return "preliminary"
+    today = today or datetime.date.today()
+    pre_start = target_day - datetime.timedelta(days=28)
+    main_start = target_day - datetime.timedelta(days=14)
+    # Admin toggle should open matching immediately even before the date window.
+    if today < pre_start:
+        return "preliminary"
+    if pre_start <= today < main_start:
+        return "preliminary"
+    if main_start <= today <= target_day:
+        return "main"
+    return "closed"
+
+
+def _selection_limit(total_count: int, phase: str) -> int:
+    if phase == "main":
+        return 1
+    if total_count <= 4:
+        return min(2, total_count)
+    return max(1, round(total_count * 0.4))
+
+
+def _school_colleges(conn: sqlite3.Connection, school_id: int) -> list[dict]:
+    colleges = conn.execute(
+        "SELECT id, name FROM colleges WHERE school_id=? ORDER BY id ASC",
+        (school_id,),
+    ).fetchall()
+    result: list[dict] = []
+    for c in colleges:
+        departments = conn.execute(
+            "SELECT id, name FROM departments WHERE college_id=? ORDER BY id ASC",
+            (c["id"],),
+        ).fetchall()
+        result.append({
+            "id": c["id"],
+            "name": c["name"],
+            "departments": [dict(d) for d in departments],
+        })
+    return result
+
+
+@app.route("/admin", methods=["GET"])
+def admin_html():
+    return render_template("admin.html")
+
+
+@app.route("/api/notices", methods=["GET"])
+def list_notices():
+    limit_raw = request.args.get("limit", "50")
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except Exception:
+        return jsonify({"error": "limit must be integer"}), 400
+    conn = _app_conn()
+    _ensure_notices_table(conn)
+    _seed_default_notices_if_empty(conn)
+    rows = conn.execute(
+        "SELECT id, title, body, is_pinned, created_at, updated_at "
+        "FROM notices "
+        "ORDER BY is_pinned DESC, updated_at DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return jsonify({"notices": [_notice_to_dict(r) for r in rows]})
+
+
+@app.route("/api/admin/notices", methods=["GET"])
+def admin_list_notices():
+    conn = _app_conn()
+    _ensure_notices_table(conn)
+    _seed_default_notices_if_empty(conn)
+    rows = conn.execute(
+        "SELECT id, title, body, is_pinned, created_at, updated_at "
+        "FROM notices "
+        "ORDER BY is_pinned DESC, updated_at DESC, id DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify({"notices": [_notice_to_dict(r) for r in rows]})
+
+
+@app.route("/api/admin/notices", methods=["POST"])
+def admin_create_notice():
+    data = request.get_json(force=True)
+    title = (data.get("title") or "").strip()
+    body = (data.get("body") or "").strip()
+    is_pinned = bool(data.get("is_pinned", False))
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    if not body:
+        return jsonify({"error": "body is required"}), 400
+    now = _now()
+    conn = _app_conn()
+    _ensure_notices_table(conn)
+    cur = conn.execute(
+        "INSERT INTO notices (title, body, is_pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (title, body, 1 if is_pinned else 0, now, now),
+    )
+    notice_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute(
+        "SELECT id, title, body, is_pinned, created_at, updated_at FROM notices WHERE id=?",
+        (notice_id,),
+    ).fetchone()
+    conn.close()
+    return jsonify({"notice": _notice_to_dict(row)}), 201
+
+
+@app.route("/api/admin/notices/<int:notice_id>", methods=["PUT", "PATCH"])
+def admin_update_notice(notice_id: int):
+    data = request.get_json(force=True)
+    title = (data.get("title") or "").strip()
+    body = (data.get("body") or "").strip()
+    is_pinned = bool(data.get("is_pinned", False))
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    if not body:
+        return jsonify({"error": "body is required"}), 400
+    now = _now()
+    conn = _app_conn()
+    _ensure_notices_table(conn)
+    cur = conn.execute(
+        "UPDATE notices SET title=?, body=?, is_pinned=?, updated_at=? WHERE id=?",
+        (title, body, 1 if is_pinned else 0, now, notice_id),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        conn.close()
+        return jsonify({"error": "notice not found"}), 404
+    row = conn.execute(
+        "SELECT id, title, body, is_pinned, created_at, updated_at FROM notices WHERE id=?",
+        (notice_id,),
+    ).fetchone()
+    conn.close()
+    return jsonify({"notice": _notice_to_dict(row)})
+
+
+@app.route("/api/admin/notices/<int:notice_id>", methods=["DELETE"])
+def admin_delete_notice(notice_id: int):
+    conn = _app_conn()
+    _ensure_notices_table(conn)
+    cur = conn.execute("DELETE FROM notices WHERE id=?", (notice_id,))
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "notice not found"}), 404
+    return jsonify({"ok": True})
+
+
+# ??? Auth ????????????????????????????????????????????????????????????????
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
     data = request.get_json(force=True)
     login_id = data.get("login_id", "").strip()
     student_id = data.get("student_id", "").strip()
+    birth_year_raw = data.get("birth_year")
     password = data.get("password", "")
     name = data.get("name", "").strip()
     is_enrolled = data.get("is_enrolled", True)
     school_name = data.get("school_name", "").strip() or data.get("school", "").strip()
+    college = data.get("college", "").strip()
+    department = data.get("department", "").strip()
     region_name = data.get("region_name", "").strip() or data.get("region", "").strip()
+    gender = data.get("gender", "").strip().lower()
+    try:
+        birth_year = int(birth_year_raw)
+    except Exception:
+        return jsonify({"error": "birth_year must be integer"}), 400
+    if birth_year < 1900 or birth_year > datetime.date.today().year:
+        return jsonify({"error": "birth_year out of range"}), 400
 
     # Frontend compatibility: student_id doubles as login_id
     if not login_id and student_id:
         login_id = student_id
 
     if not login_id or not password or not name:
-        return jsonify({"error": "ID, 비밀번호, 이름은 필수입니다."}), 400
+        return jsonify({"error": "ID, 鍮꾨?踰덊샇, ?대쫫? ?꾩닔?낅땲??"}), 400
+    if gender not in ("male", "female"):
+        return jsonify({"error": "gender must be male or female"}), 400
+    if bool(is_enrolled):
+        if not school_name or not college or not department or not student_id:
+            return jsonify({"error": "school_name, college, department, student_id are required for enrolled user"}), 400
+        conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        school_row = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
+        if not school_row:
+            conn.close()
+            return jsonify({"error": "school not found"}), 404
+        college_row = conn.execute(
+            "SELECT id FROM colleges WHERE school_id=? AND name=?",
+            (school_row["id"], college),
+        ).fetchone()
+        if not college_row:
+            conn.close()
+            return jsonify({"error": "college not found for school"}), 400
+        dept_row = conn.execute(
+            "SELECT id FROM departments WHERE college_id=? AND name=?",
+            (college_row["id"], department),
+        ).fetchone()
+        conn.close()
+        if not dept_row:
+            return jsonify({"error": "department not found for college"}), 400
 
     if db.get_user_by_login_id(login_id):
-        return jsonify({"error": "이미 등록된 ID입니다."}), 409
+        return jsonify({"error": "?대? ?깅줉??ID?낅땲??"}), 409
 
     user = User(
         login_id=login_id,
         student_id=student_id,
+        birth_year=birth_year,
         password_hash=hash_password(password),
         name=name,
         is_enrolled=1 if is_enrolled else 0,
         school_name=school_name,
+        college=college,
+        department=department,
         region_name=region_name,
+        gender=gender,
     )
     db.save_user(user)
     token = create_token(user.uid, user.login_id, user.name, user.student_id)
     return jsonify({
         "token": token,
-        "user": {"uid": user.uid, "login_id": user.login_id, "student_id": user.student_id, "name": user.name},
+        "user": {
+            "uid": user.uid,
+            "login_id": user.login_id,
+            "student_id": user.student_id,
+            "birth_year": user.birth_year,
+            "name": user.name,
+            "school_name": user.school_name,
+            "college": user.college,
+            "department": user.department,
+            "region_name": user.region_name,
+            "is_enrolled": user.is_enrolled,
+            "gender": user.gender,
+        },
     }), 201
 
 
@@ -102,13 +449,35 @@ def login():
     password = data.get("password", "")
 
     user = db.get_user_by_login_id(login_id)
-    if not user or not verify_password(password, user.password_hash):
-        return jsonify({"error": "ID 또는 비밀번호가 올바르지 않습니다."}), 401
+    if not user:
+        return jsonify({"error": "ID ?먮뒗 鍮꾨?踰덊샇媛 ?щ컮瑜댁? ?딆뒿?덈떎."}), 401
+
+    # Backward compatibility:
+    # - old clients sent raw password
+    # - new clients send sha256(password)
+    ok = verify_password(password, user.password_hash)
+    if not ok:
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        ok = verify_password(hashed_password, user.password_hash)
+    if not ok:
+        return jsonify({"error": "ID ?먮뒗 鍮꾨?踰덊샇媛 ?щ컮瑜댁? ?딆뒿?덈떎."}), 401
 
     token = create_token(user.uid, user.login_id, user.name, user.student_id)
     return jsonify({
         "token": token,
-        "user": {"uid": user.uid, "login_id": user.login_id, "student_id": user.student_id, "name": user.name},
+        "user": {
+            "uid": user.uid,
+            "login_id": user.login_id,
+            "student_id": user.student_id,
+            "birth_year": user.birth_year,
+            "name": user.name,
+            "school_name": user.school_name,
+            "college": user.college,
+            "department": user.department,
+            "region_name": user.region_name,
+            "is_enrolled": user.is_enrolled,
+            "gender": user.gender,
+        },
     })
 
 
@@ -123,14 +492,268 @@ def me():
         "uid": user.uid,
         "login_id": user.login_id,
         "student_id": user.student_id,
+        "birth_year": user.birth_year,
         "name": user.name,
         "is_enrolled": user.is_enrolled,
         "school_name": user.school_name,
+        "college": user.college,
+        "department": user.department,
         "region_name": user.region_name,
+        "gender": user.gender,
     })
 
 
-# ─── Profile ─────────────────────────────────────────────────────────────
+@app.route("/api/schools", methods=["GET"])
+def list_schools():
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    schools = conn.execute("SELECT * FROM schools ORDER BY id ASC").fetchall()
+    result = []
+    for s in schools:
+        dorms = conn.execute(
+            "SELECT id, name, gender FROM dormitories WHERE school_id=? ORDER BY id ASC",
+            (s["id"],),
+        ).fetchall()
+        colleges = _school_colleges(conn, s["id"])
+        phase = _school_matching_phase(s)
+        result.append({
+            "id": s["id"],
+            "name": s["name"],
+            "recruitment_start": s["recruitment_start"],
+            "recruitment_end": s["recruitment_end"],
+            "matching_enabled": bool(s["matching_enabled"]),
+            "matching_phase": phase,
+            "dormitories": [dict(d) for d in dorms],
+            "colleges": colleges,
+        })
+    conn.close()
+    return jsonify({"schools": result})
+
+
+@app.route("/api/admin/schools", methods=["POST"])
+def admin_create_school():
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    recruitment_start = data.get("recruitment_start")
+    recruitment_end = data.get("recruitment_end")
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO schools (name, recruitment_start, recruitment_end, matching_enabled) VALUES (?, ?, ?, 1)",
+            (name, recruitment_start, recruitment_end),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "school already exists"}), 409
+    conn.close()
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/admin/schools/<int:school_id>/dorms", methods=["PUT"])
+def admin_update_dorms(school_id: int):
+    data = request.get_json(force=True)
+    dorms = data.get("dorms", []) or []
+    if not isinstance(dorms, list):
+        return jsonify({"error": "dorms must be list"}), 400
+    normalized: list[tuple[str, str]] = []
+    for d in dorms:
+        name = (d.get("name") or "").strip()
+        gender = (d.get("gender") or "").strip().lower()
+        if not name:
+            return jsonify({"error": "dorm name is required"}), 400
+        if gender not in ("male", "female", "coed"):
+            return jsonify({"error": "dorm gender must be male, female, or coed"}), 400
+        normalized.append((name, gender))
+
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    existing = conn.execute("SELECT id FROM schools WHERE id=?", (school_id,)).fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "school not found"}), 404
+    conn.execute("DELETE FROM dormitories WHERE school_id=?", (school_id,))
+    for name, gender in normalized:
+        conn.execute(
+            "INSERT INTO dormitories (school_id, name, gender) VALUES (?, ?, ?)",
+            (school_id, name, gender),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/schools/<int:school_id>/schedule", methods=["PATCH"])
+def admin_update_schedule(school_id: int):
+    data = request.get_json(force=True)
+    recruitment_start = data.get("recruitment_start")
+    recruitment_end = data.get("recruitment_end")
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    cur = conn.execute(
+        "UPDATE schools SET recruitment_start=?, recruitment_end=? WHERE id=?",
+        (recruitment_start, recruitment_end, school_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "school not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/schools/<int:school_id>/colleges", methods=["PUT"])
+def admin_update_colleges(school_id: int):
+    data = request.get_json(force=True)
+    colleges = data.get("colleges", []) or []
+    if not isinstance(colleges, list):
+        return jsonify({"error": "colleges must be list"}), 400
+
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    existing = conn.execute("SELECT id FROM schools WHERE id=?", (school_id,)).fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "school not found"}), 404
+
+    conn.execute(
+        "DELETE FROM departments WHERE college_id IN (SELECT id FROM colleges WHERE school_id=?)",
+        (school_id,),
+    )
+    conn.execute("DELETE FROM colleges WHERE school_id=?", (school_id,))
+    for c in colleges:
+        college_name = (c.get("name") or "").strip()
+        departments = c.get("departments", []) or []
+        if not college_name:
+            conn.close()
+            return jsonify({"error": "college name is required"}), 400
+        if not isinstance(departments, list):
+            conn.close()
+            return jsonify({"error": "departments must be list"}), 400
+        cur = conn.execute(
+            "INSERT INTO colleges (school_id, name) VALUES (?, ?)",
+            (school_id, college_name),
+        )
+        college_id = cur.lastrowid
+        for d in departments:
+            dep_name = (d.get("name") or "").strip() if isinstance(d, dict) else str(d).strip()
+            if not dep_name:
+                conn.close()
+                return jsonify({"error": "department name is required"}), 400
+            conn.execute(
+                "INSERT INTO departments (college_id, name) VALUES (?, ?)",
+                (college_id, dep_name),
+            )
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/schools/<int:school_id>/matching", methods=["PATCH"])
+def admin_toggle_matching(school_id: int):
+    data = request.get_json(force=True)
+    is_open = bool(data.get("is_open", True))
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    cur = conn.execute(
+        "UPDATE schools SET matching_enabled=? WHERE id=?",
+        (1 if is_open else 0, school_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "school not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/matching/options", methods=["GET"])
+@login_required
+def matching_options():
+    payload = request.current_user
+    user = db.get_user_by_uid(payload["user_uid"])
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    if user.gender not in ("male", "female"):
+        return jsonify({"error": "user gender is required"}), 400
+    school = _get_school_row(user.school_name)
+    if not school:
+        return jsonify({"error": "school not found"}), 404
+    phase = _school_matching_phase(school)
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    dorms = conn.execute(
+        "SELECT id, name, gender FROM dormitories WHERE school_id=? ORDER BY id ASC",
+        (school["id"],),
+    ).fetchall()
+    conn.close()
+    visible = [dict(d) for d in dorms if d["gender"] in ("coed", user.gender)]
+    max_select = _selection_limit(len(visible), phase)
+    profile = db.get_profile_by_user_uid(payload["user_uid"])
+    selected = []
+    if profile:
+        if phase == "main":
+            selected = [profile.accepted_hall] if profile.accepted_hall else []
+        else:
+            selected = list(profile.hope_halls or [])
+    return jsonify({
+        "school_name": school["name"],
+        "phase": phase,
+        "user_gender": user.gender,
+        "visible_dorms": visible,
+        "max_selectable": max_select,
+        "selected_halls": selected,
+    })
+
+
+@app.route("/api/matching/preferences", methods=["POST"])
+@login_required
+def save_matching_preferences():
+    payload = request.current_user
+    user = db.get_user_by_uid(payload["user_uid"])
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    school = _get_school_row(user.school_name)
+    if not school:
+        return jsonify({"error": "school not found"}), 404
+    phase = _school_matching_phase(school)
+    if phase == "closed":
+        return jsonify({"error": "matching period is closed"}), 400
+
+    data = request.get_json(force=True)
+    halls = data.get("selected_halls", []) or []
+    if not isinstance(halls, list):
+        return jsonify({"error": "selected_halls must be list"}), 400
+
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    dorms = conn.execute(
+        "SELECT name, gender FROM dormitories WHERE school_id=?",
+        (school["id"],),
+    ).fetchall()
+    conn.close()
+    allowed = {d["name"] for d in dorms if d["gender"] in ("coed", user.gender)}
+    if any(h not in allowed for h in halls):
+        return jsonify({"error": "contains invalid or gender-mismatched dorm"}), 400
+    max_sel = _selection_limit(len(allowed), phase)
+    if len(halls) > max_sel:
+        return jsonify({"error": f"at most {max_sel} halls can be selected"}), 400
+
+    existing = db.get_profile_by_user_uid(payload["user_uid"])
+    if not existing:
+        return jsonify({"error": "profile not found"}), 404
+    existing.matching_phase = phase
+    if phase == "main":
+        existing.accepted_hall = halls[0] if halls else ""
+        existing.hope_halls = []
+        existing.dormitory_hall = existing.accepted_hall
+    else:
+        existing.hope_halls = halls
+        existing.accepted_hall = ""
+        existing.dormitory_hall = halls[0] if halls else ""
+    db.save_profile(existing)
+    return jsonify({"ok": True, "phase": phase, "selected_halls": halls})
+
+
+# ??? Profile ?????????????????????????????????????????????????????????????
 
 @app.route("/api/profile", methods=["GET"])
 @login_required
@@ -138,8 +761,30 @@ def get_profile():
     payload = request.current_user
     profile = db.get_profile_by_user_uid(payload["user_uid"])
     if not profile:
-        return jsonify({"error": "설문조사를 먼저 작성해주세요."}), 404
+        return jsonify({"exists": False, "profile": None}), 200
     return jsonify(profile_to_dict(profile))
+
+
+@app.route("/api/profile/public/<user_uid>", methods=["GET"])
+@login_required
+def get_public_profile(user_uid):
+    payload = request.current_user
+    profile = db.get_profile_by_user_uid(user_uid)
+    if not profile:
+        return jsonify({"error": "profile not found"}), 404
+    # Allow only users with an existing relationship in thread/session.
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT 1 FROM chat_threads "
+        "WHERE ((user_a=? AND user_b=?) OR (user_a=? AND user_b=?)) "
+        "LIMIT 1",
+        (payload["user_uid"], user_uid, user_uid, payload["user_uid"]),
+    ).fetchone()
+    conn.close()
+    if not row and payload["user_uid"] != user_uid:
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify({"profile": profile_to_dict(profile)})
 
 
 @app.route("/api/profile", methods=["POST"])
@@ -154,15 +799,45 @@ def post_profile():
     existing = db.get_profile_by_user_uid(payload["user_uid"])
     uid = existing.uid if existing else None
 
-    # 이름/학번은 User에서 자동 연동
+    matching_phase = data.get("matching_phase", "preliminary")
+    hope_halls = data.get("hope_halls", []) or []
+    accepted_hall = data.get("accepted_hall", "") or ""
+    room_capacity = int(data.get("room_capacity", 2) or 2)
+    dormitory_hall = data.get("dormitory_hall", "") or ""
+    conn = sqlite3.connect(db.SCHOOLS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    school_row = conn.execute("SELECT id FROM schools WHERE name=?", (user.school_name,)).fetchone()
+    if school_row:
+        dorm_rows = conn.execute("SELECT name FROM dormitories WHERE school_id=?", (school_row["id"],)).fetchall()
+        allowed_halls = {r["name"] for r in dorm_rows}
+    else:
+        allowed_halls = set()
+    conn.close()
+    if matching_phase not in ("preliminary", "main"):
+        return jsonify({"error": "matching_phase must be preliminary or main"}), 400
+    if room_capacity not in (2, 3, 4):
+        return jsonify({"error": "room_capacity must be 2, 3, or 4"}), 400
+    if matching_phase == "preliminary":
+        if len(hope_halls) > 2:
+            return jsonify({"error": "preliminary phase allows up to 2 hope_halls"}), 400
+        if any(h not in allowed_halls for h in hope_halls):
+            return jsonify({"error": "invalid dorm hall in hope_halls"}), 400
+        accepted_hall = ""
+    else:
+        if accepted_hall and accepted_hall not in allowed_halls:
+            return jsonify({"error": "invalid accepted_hall"}), 400
+        hope_halls = []
+        dormitory_hall = accepted_hall or dormitory_hall
+
+    # ?대쫫/?숇쾲? User?먯꽌 ?먮룞 ?곕룞
     profile = RoommateProfile(
         uid=uid or generate_uid(),
         user_uid=payload["user_uid"],
         name=user.name,
         student_id=user.student_id,
-        birth_year=data.get("birth_year", 2005),
-        college=data.get("college", ""),
-        department=data.get("department", ""),
+        birth_year=user.birth_year or 2005,
+        college=user.college or "",
+        department=user.department or "",
         dorm_duration=data.get("dorm_duration", 1),
         home_visit_cycle=data.get("home_visit_cycle", 2),
         perfume=data.get("perfume", 0),
@@ -201,6 +876,13 @@ def post_profile():
         meal_together=data.get("meal_together", 2),
         exercise_together=data.get("exercise_together", 1),
         friend_invite=data.get("friend_invite", 1),
+        dormitory_hall=dormitory_hall,
+        matching_phase=matching_phase,
+        hope_halls=hope_halls,
+        accepted_hall=accepted_hall,
+        room_capacity=room_capacity,
+        non_negotiable_items=data.get("non_negotiable_items", []),
+        non_negotiable_weights=data.get("non_negotiable_weights", []),
     )
     db.save_profile(profile)
     return jsonify(profile_to_dict(profile))
@@ -212,12 +894,12 @@ def get_persona():
     payload = request.current_user
     profile = db.get_profile_by_user_uid(payload["user_uid"])
     if not profile:
-        return jsonify({"error": "프로필이 없습니다."}), 404
+        return jsonify({"error": "?꾨줈?꾩씠 ?놁뒿?덈떎."}), 404
     persona = profile.persona or classify_persona(profile)
     return jsonify({"persona": persona})
 
 
-# ─── Matching ────────────────────────────────────────────────────────────
+# ??? Matching ????????????????????????????????????????????????????????????
 
 @app.route("/api/match/top", methods=["GET"])
 @login_required
@@ -228,7 +910,7 @@ def match_top():
 
     target = db.get_profile_by_user_uid(payload["user_uid"])
     if not target:
-        return jsonify({"error": "설문조사를 먼저 작성해주세요."}), 404
+        return jsonify({"error": "?ㅻЦ議곗궗瑜?癒쇱? ?묒꽦?댁＜?몄슂."}), 404
 
     pool = db.fetch_profiles()
     results = rank_matches(target, pool, top_n=top_n, exclude_blocked=exclude_blocked)
@@ -241,12 +923,32 @@ def match_pairs():
     exclude_blocked = request.args.get("exclude_blocked", "true").lower() == "true"
     profiles = db.fetch_profiles()
     if len(profiles) < 2:
-        return jsonify({"error": "매칭할 프로필이 부족합니다."}), 400
+        return jsonify({"error": "留ㅼ묶???꾨줈?꾩씠 遺議깊빀?덈떎."}), 400
     results = best_pairings(profiles, exclude_blocked=exclude_blocked)
     return jsonify({"pairs": [r.to_dict() for r in results]})
 
 
-# ─── Match Requests ──────────────────────────────────────────────────────
+# ??? Match Requests ??????????????????????????????????????????????????????
+
+MAX_ACTIVE_MATCHES = 6
+
+
+def _count_active_matches(user_uid: str) -> int:
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    # ?닿? 蹂대궦 pending + accepted
+    sent = conn.execute(
+        "SELECT COUNT(*) FROM match_requests WHERE from_user=? AND status IN ('pending','accepted')",
+        (user_uid,),
+    ).fetchone()[0]
+    # ?닿? 諛쏆? accepted
+    received = conn.execute(
+        "SELECT COUNT(*) FROM match_requests WHERE to_user=? AND status='accepted'",
+        (user_uid,),
+    ).fetchone()[0]
+    conn.close()
+    return sent + received
+
 
 @app.route("/api/match/request", methods=["POST"])
 @login_required
@@ -255,17 +957,21 @@ def create_match_request():
     data = request.get_json(force=True)
     to_user = data.get("to_user", "")
     if not to_user:
-        return jsonify({"error": "대상 사용자가 필요합니다."}), 400
+        return jsonify({"error": "????ъ슜?먭? ?꾩슂?⑸땲??"}), 400
+
+    # 理쒕? 留ㅼ묶 ???쒗븳
+    if _count_active_matches(payload["user_uid"]) >= MAX_ACTIVE_MATCHES:
+        return jsonify({"error": "理쒕? 6媛쒖쓽 留ㅼ묶留?媛?ν빀?덈떎."}), 403
 
     conn = sqlite3.connect(db.DB_PATH)
-    # 중복 검사
+    # 以묐났 寃??
     existing = conn.execute(
         "SELECT * FROM match_requests WHERE from_user=? AND to_user=?",
         (payload["user_uid"], to_user),
     ).fetchone()
     if existing:
         conn.close()
-        return jsonify({"error": "이미 요청한 상태입니다."}), 409
+        return jsonify({"error": "?대? ?붿껌???곹깭?낅땲??"}), 409
 
     uid = generate_uid()
     now = _now()
@@ -276,7 +982,7 @@ def create_match_request():
     conn.commit()
     conn.close()
 
-    # 실시간 푸시 (SSE)
+    # ?ㅼ떆媛??몄떆 (SSE)
     broadcast_message(to_user, "match_request", {
         "from_user": payload["user_uid"],
         "from_name": payload.get("name", ""),
@@ -293,19 +999,19 @@ def update_match_request(uid):
     data = request.get_json(force=True)
     status = data.get("status", "")
     if status not in ("accepted", "rejected"):
-        return jsonify({"error": "status는 accepted 또는 rejected만 가능합니다."}), 400
+        return jsonify({"error": "status??accepted ?먮뒗 rejected留?媛?ν빀?덈떎."}), 400
 
     conn = sqlite3.connect(db.DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM match_requests WHERE uid=?", (uid,)).fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "요청을 찾을 수 없습니다."}), 404
+        return jsonify({"error": "?붿껌??李얠쓣 ???놁뒿?덈떎."}), 404
 
     req = dict(row)
     if req["to_user"] != payload["user_uid"]:
         conn.close()
-        return jsonify({"error": "권한이 없습니다."}), 403
+        return jsonify({"error": "沅뚰븳???놁뒿?덈떎."}), 403
 
     now = _now()
     conn.execute(
@@ -314,7 +1020,7 @@ def update_match_request(uid):
     )
 
     if status == "accepted":
-        # match_history 추가
+        # match_history 異붽?
         muid = generate_uid()
         conn.execute(
             "INSERT INTO match_history (uid, user_a, user_b, status, matched_at) VALUES (?, ?, ?, ?, ?)",
@@ -323,7 +1029,7 @@ def update_match_request(uid):
     conn.commit()
     conn.close()
 
-    # 알림
+    # ?뚮┝
     broadcast_message(req["from_user"], "match_response", {
         "request_uid": uid,
         "status": status,
@@ -353,7 +1059,36 @@ def list_match_requests():
     return jsonify([dict(r) for r in rows])
 
 
-# ─── Chat (SSE) ──────────────────────────────────────────────────────────
+# ??? Chat (SSE) ??????????????????????????????????????????????????????????
+
+CHAT_RETENTION_DAYS = 7
+
+
+def _cleanup_old_messages():
+    """3???댁긽 ??梨꾪똿 硫붿떆吏瑜???젣?쒕떎."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=CHAT_RETENTION_DAYS)).isoformat() + "Z"
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("DELETE FROM chat_messages WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def _delete_message(uid: str):
+    """?뱀젙 硫붿떆吏瑜?利됱떆 ??젣?쒕떎 (legacy - ?ъ슜 ????."""
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("DELETE FROM chat_messages WHERE uid=?", (uid,))
+    conn.commit()
+    conn.close()
+
+
+def _expire_old_messages(days: int = CHAT_RETENTION_DAYS):
+    """3???댁긽 ??硫붿떆吏瑜???젣?쒕떎."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat() + "Z"
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("DELETE FROM chat_messages WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
 
 @app.route("/api/chat/stream", methods=["GET"])
 @login_required
@@ -365,13 +1100,17 @@ def chat_stream():
         q: queue.Queue = queue.Queue(maxsize=100)
         _add_sse_queue(user_uid, q)
         try:
-            # 초기 연결 heartbeat
+            # 珥덇린 ?곌껐 heartbeat
             yield f"event: connected\ndata: {jsonify({'user_uid': user_uid}).data.decode()}\n\n"
             while True:
                 try:
                     msg = q.get(timeout=30)
                     event = msg["event"]
-                    data_str = __import__("json").dumps(msg["data"], ensure_ascii=False)
+                    data = msg["data"]
+                    # 利됱떆 ??젣 ?쒓굅 - 硫붿떆吏??read ACK ?먮뒗 3??TTL濡???젣
+                    # if event == "chat_message" and data.get("uid"):
+                    #     _delete_message(data["uid"])
+                    data_str = __import__("json").dumps(data, ensure_ascii=False)
                     yield f"event: {event}\ndata: {data_str}\n\n"
                 except queue.Empty:
                     yield ":keep-alive\n\n"
@@ -399,7 +1138,10 @@ def chat_send():
     content = data.get("content", "").strip()
     msg_type = data.get("type", "text")
     if not receiver or not content:
-        return jsonify({"error": "receiver와 content는 필수입니다."}), 400
+        return jsonify({"error": "receiver? content???꾩닔?낅땲??"}), 400
+
+    # 二쇨린???ㅻ옒??硫붿떆吏 ?뺣━
+    _cleanup_old_messages()
 
     uid = generate_uid()
     now = _now()
@@ -411,7 +1153,7 @@ def chat_send():
     conn.commit()
     conn.close()
 
-    # 실시간 전달
+    # ?ㅼ떆媛??꾨떖
     broadcast_message(receiver, "chat_message", {
         "uid": uid,
         "sender": payload["user_uid"],
@@ -431,7 +1173,7 @@ def chat_messages():
     other = request.args.get("with", "")
     limit = request.args.get("limit", 50, type=int)
     if not other:
-        return jsonify({"error": "with 파라미터가 필요합니다."}), 400
+        return jsonify({"error": "with ?뚮씪誘명꽣媛 ?꾩슂?⑸땲??"}), 400
 
     conn = sqlite3.connect(db.DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -451,7 +1193,7 @@ def chat_read():
     data = request.get_json(force=True)
     other = data.get("with", "")
     if not other:
-        return jsonify({"error": "with 파라미터가 필요합니다."}), 400
+        return jsonify({"error": "with ?뚮씪誘명꽣媛 ?꾩슂?⑸땲??"}), 400
 
     conn = sqlite3.connect(db.DB_PATH)
     conn.execute(
@@ -463,7 +1205,1180 @@ def chat_read():
     return jsonify({"ok": True})
 
 
-# ─── Reviews ─────────────────────────────────────────────────────────────
+# --- Pool / Session / Thread Matching Protocol ---
+
+def _profile_hall_for_phase(profile: RoommateProfile) -> str:
+    if profile.matching_phase == "main":
+        return profile.accepted_hall or profile.dormitory_hall
+    return profile.dormitory_hall
+
+
+def _is_profile_compatible(target: RoommateProfile, other: RoommateProfile) -> bool:
+    if target.user_uid == other.user_uid:
+        return False
+    if target.matching_phase != other.matching_phase:
+        return False
+    if target.matching_phase == "preliminary":
+        if target.hope_halls and other.hope_halls:
+            return bool(set(target.hope_halls) & set(other.hope_halls))
+        return True
+    return _profile_hall_for_phase(target) == _profile_hall_for_phase(other)
+
+
+def _select_quota(results):
+    quota = [(90.0, 100.1, 1), (80.0, 90.0, 2), (60.0, 80.0, 2)]
+    picked = []
+    used = set()
+
+    def pick_band(lo: float, hi: float, count: int):
+        band = [r for r in results if lo <= r.score < hi and r.profile_b.user_uid not in used]
+        if not band or count <= 0:
+            return []
+        if len(band) <= count:
+            return band
+        return random.sample(band, count)
+
+    for lo, hi, count in quota:
+        chosen = pick_band(lo, hi, count)
+        picked.extend(chosen)
+        used.update(r.profile_b.user_uid for r in chosen)
+
+    # Fallback cascade: 90 deficit -> 80, then 70, then 60.
+    for lo, hi in [(80.0, 90.0), (70.0, 80.0), (60.0, 70.0)]:
+        if len(picked) >= 5:
+            break
+        chosen = pick_band(lo, hi, 5 - len(picked))
+        picked.extend(chosen)
+        used.update(r.profile_b.user_uid for r in chosen)
+
+    return picked[:5]
+
+
+def _insert_system_message(conn: sqlite3.Connection, thread_uid: str, session_uid: str, sender: str, receiver: str, content: str):
+    now = _now()
+    expires = (datetime.datetime.utcnow() + datetime.timedelta(days=CHAT_RETENTION_DAYS)).isoformat() + "Z"
+    conn.execute(
+        "INSERT INTO chat_messages (uid, session_uid, thread_uid, sender, receiver, content, type, read, expires_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (generate_uid(), session_uid, thread_uid, sender, receiver, content, "system", 0, expires, now),
+    )
+
+
+def _broadcast_thread_state(conn: sqlite3.Connection, thread_uid: str, closed_reason: str, extra: dict | None = None):
+    row = conn.execute("SELECT * FROM chat_threads WHERE uid=?", (thread_uid,)).fetchone()
+    if not row:
+        return
+    payload = {
+        "event_type": "thread_state",
+        "thread_id": thread_uid,
+        "session_id": row["session_uid"],
+        "status": row["status"],
+        "closed_reason": closed_reason,
+    }
+    if extra:
+        payload.update(extra)
+    broadcast_message(row["user_a"], "thread_state", payload)
+    broadcast_message(row["user_b"], "thread_state", payload)
+
+
+def _session_side_for_user(session_row: sqlite3.Row, user_uid: str) -> str | None:
+    if user_uid == session_row["user_uid"]:
+        return "user"
+    room_members = [u.strip() for u in (session_row["room_member_uids"] or "").split(",") if u and u.strip()]
+    if user_uid == session_row["candidate_uid"] or user_uid in room_members:
+        return "candidate"
+    return None
+
+
+def _has_blocking_match_state(conn: sqlite3.Connection, user_uid: str) -> tuple[bool, str | None]:
+    rows = conn.execute(
+        "SELECT status, user_decision, candidate_decision FROM match_sessions "
+        "WHERE (user_uid=? OR candidate_uid=? OR room_member_uids=? OR room_member_uids LIKE ? OR room_member_uids LIKE ? OR room_member_uids LIKE ?)",
+        (user_uid, user_uid, user_uid, f"{user_uid},%", f"%,{user_uid},%", f"%,{user_uid}"),
+    ).fetchall()
+    for row in rows:
+        if (row["status"] or "") == "confirmed":
+            return True, "already_matched"
+        if (row["status"] or "") == "active" and (
+            (row["user_decision"] or "") == "hold" or (row["candidate_decision"] or "") == "hold"
+        ):
+            return True, "on_hold"
+    return False, None
+
+
+def _chat_exchange_count(conn: sqlite3.Connection, thread_id: str) -> int:
+    row = conn.execute(
+        "SELECT chat_exchange_count FROM chat_threads WHERE uid=?",
+        (thread_id,),
+    ).fetchone()
+    if not row:
+        return 0
+    try:
+        return int(row["chat_exchange_count"] or 0)
+    except Exception:
+        return 0
+
+
+def _expire_chat_messages_and_sessions():
+    now = datetime.datetime.utcnow()
+    cutoff_3d = (now - datetime.timedelta(days=CHAT_RETENTION_DAYS)).isoformat() + "Z"
+    cutoff_2d = (now - datetime.timedelta(days=2)).isoformat() + "Z"
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("DELETE FROM chat_messages WHERE created_at < ?", (cutoff_3d,))
+    stale = conn.execute(
+        "SELECT uid FROM match_sessions WHERE status='active' AND last_activity_at IS NOT NULL AND last_activity_at < ?",
+        (cutoff_2d,),
+    ).fetchall()
+    for row in stale:
+        now_str = _now()
+        conn.execute("UPDATE match_sessions SET status='cancelled', closed_at=? WHERE uid=?", (now_str, row["uid"]))
+        thread_rows = conn.execute(
+            "SELECT uid FROM chat_threads WHERE session_uid=? AND status='open'",
+            (row["uid"],),
+        ).fetchall()
+        conn.execute(
+            "UPDATE chat_threads SET status='closed', closed_reason='no_response', closed_at=? WHERE session_uid=? AND status='open'",
+            (now_str, row["uid"]),
+        )
+        for thread_row in thread_rows:
+            _broadcast_thread_state(conn, thread_row["uid"], "no_response")
+    conn.commit()
+    conn.close()
+
+
+@app.route("/api/match/pool/refresh", methods=["POST"])
+@login_required
+def refresh_pool():
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    target = db.get_profile_by_user_uid(payload["user_uid"])
+    if not target:
+        return jsonify({"error": "profile is required"}), 404
+
+    pool = [p for p in db.fetch_profiles() if _is_profile_compatible(target, p)]
+    results = [match(target, p) for p in pool]
+    results = [r for r in results if not r.hard_block]
+    results.sort(key=lambda x: x.score, reverse=True)
+    selected = _select_quota(results)
+
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("DELETE FROM match_pool_candidates WHERE user_uid=?", (payload["user_uid"],))
+    candidates = []
+    for r in selected:
+        candidate = {
+            "candidate_type": "individual",
+            "uid": r.profile_b.uid,
+            "user_uid": r.profile_b.user_uid,
+            "display_name": r.profile_b.name,
+            "shared_score": r.score,
+            "member_scores": [r.score],
+            "member_names": [r.profile_b.name],
+            "tier": _tier_from_score(r.score),
+            "room_capacity": r.profile_b.room_capacity,
+            "detail": r.detail,
+            "border_style": "default",
+            "profile": profile_to_dict(r.profile_b),
+            "score": r.score,
+        }
+        candidates.append(candidate)
+        conn.execute(
+            "INSERT INTO match_pool_candidates (uid, user_uid, candidate_uid, candidate_type, display_name, shared_score, member_scores, member_names, tier, room_capacity, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                generate_uid(),
+                payload["user_uid"],
+                r.profile_b.user_uid,
+                "individual",
+                r.profile_b.name,
+                r.score,
+                json.dumps([r.score]),
+                json.dumps([r.profile_b.name], ensure_ascii=False),
+                _tier_from_score(r.score),
+                r.profile_b.room_capacity,
+                json.dumps(r.detail, ensure_ascii=False),
+                now,
+            ),
+        )
+
+    if target.room_capacity >= 3 and len(selected) >= 2:
+        a, b = selected[0], selected[1]
+        shared = round((a.score + b.score) / 2, 2)
+        display_name = f"{a.profile_b.name}, {b.profile_b.name}의 방"
+        room_payload = {
+            "candidate_type": "room",
+            "uid": f"room:{a.profile_b.user_uid}:{b.profile_b.user_uid}",
+            "user_uid": "",
+            "display_name": display_name,
+            "shared_score": shared,
+            "member_scores": [a.score, b.score],
+            "member_names": [a.profile_b.name, b.profile_b.name],
+            "tier": _tier_from_score(shared),
+            "room_capacity": target.room_capacity,
+            "detail": {
+                k: round((a.detail.get(k, 0) + b.detail.get(k, 0)) / 2, 1)
+                for k in set(a.detail.keys()) | set(b.detail.keys())
+            },
+            "border_style": "deep_blue",
+            "members": [profile_to_dict(a.profile_b), profile_to_dict(b.profile_b)],
+            "score": shared,
+        }
+        candidates.insert(0, room_payload)
+        conn.execute(
+            "INSERT INTO match_pool_candidates (uid, user_uid, candidate_uid, candidate_type, display_name, shared_score, member_scores, member_names, tier, room_capacity, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                generate_uid(),
+                payload["user_uid"],
+                f"{a.profile_b.user_uid},{b.profile_b.user_uid}",
+                "room",
+                display_name,
+                shared,
+                json.dumps([a.score, b.score]),
+                json.dumps([a.profile_b.name, b.profile_b.name], ensure_ascii=False),
+                _tier_from_score(shared),
+                target.room_capacity,
+                json.dumps(room_payload["detail"], ensure_ascii=False),
+                now,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+    return jsonify({"candidates": candidates})
+
+
+@app.route("/api/match/pool", methods=["GET"])
+@login_required
+def get_pool():
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM match_pool_candidates WHERE user_uid=? ORDER BY created_at DESC",
+        (payload["user_uid"],),
+    ).fetchall()
+    conn.close()
+    candidates = []
+    for r in rows:
+        member_scores = json.loads(r["member_scores"]) if r["member_scores"] else []
+        member_names = json.loads(r["member_names"]) if r["member_names"] else []
+        detail = json.loads(r["detail"]) if r["detail"] else {}
+        candidate_type = r["candidate_type"] or "individual"
+        candidate_uid = r["candidate_uid"] or ""
+        candidate_uids = [u.strip() for u in candidate_uid.split(",") if u.strip()]
+        item = {
+            "candidate_type": candidate_type,
+            "display_name": r["display_name"] or "",
+            "shared_score": r["shared_score"] or 0,
+            "member_scores": member_scores,
+            "member_names": member_names,
+            "tier": r["tier"],
+            "room_capacity": r["room_capacity"] or 2,
+            "detail": detail,
+            "candidate_uids": candidate_uids,
+            "border_style": "deep_blue" if (candidate_type == "room") else "default",
+            "score": r["shared_score"] or 0,
+            "profile": None,
+            "members": [],
+            "uid": "",
+            "user_uid": "",
+        }
+        if candidate_type == "individual":
+            p = db.get_profile_by_user_uid(r["candidate_uid"])
+            if not p:
+                continue
+            item["uid"] = p.uid
+            item["user_uid"] = p.user_uid
+            item["profile"] = profile_to_dict(p)
+            item["display_name"] = p.name
+        else:
+            item["uid"] = f"pool:{r['uid']}"
+            members = []
+            for uid in candidate_uids:
+                p = db.get_profile_by_user_uid(uid.strip())
+                if p:
+                    members.append(profile_to_dict(p))
+            item["members"] = members
+        candidates.append(item)
+    return jsonify({"candidates": candidates})
+
+
+@app.route("/api/match/session/enter", methods=["POST"])
+@login_required
+def enter_session():
+    payload = request.current_user
+    data = request.get_json(force=True)
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return jsonify({"error": "candidate is required"}), 400
+
+    candidate_uids = [str(c).strip() for c in candidates if str(c).strip()]
+    if not candidate_uids:
+        return jsonify({"error": "candidate is required"}), 400
+    if len(candidate_uids) > 5:
+        return jsonify({"error": "up to 5 candidates are allowed"}), 400
+
+    if payload["user_uid"] in candidate_uids:
+        return jsonify({"error": "cannot create session with yourself"}), 400
+
+    uniq = []
+    seen = set()
+    for uid in candidate_uids:
+        if uid not in seen:
+            uniq.append(uid)
+            seen.add(uid)
+    candidate_uids = uniq
+
+    now = _now()
+    session_id = generate_uid()
+
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT cooldown_until FROM match_cooldowns WHERE user_uid=?", (payload["user_uid"],)).fetchone()
+    if row and row["cooldown_until"]:
+        t = _parse_ts(row["cooldown_until"])
+        if t and datetime.datetime.utcnow() < t:
+            conn.close()
+            return jsonify({"error": "cooldown active", "cooldown_until": row["cooldown_until"]}), 403
+    blocked, reason = _has_blocking_match_state(conn, payload["user_uid"])
+    if blocked:
+        conn.close()
+        return jsonify({"error": reason or "blocked"}), 403
+
+    for uid in candidate_uids:
+        if not db.get_user_by_uid(uid):
+            conn.close()
+            return jsonify({"error": f"candidate not found: {uid}"}), 404
+
+    existing_threads_by_candidate: dict[str, sqlite3.Row] = {}
+    for candidate_uid in candidate_uids:
+        row = conn.execute(
+            "SELECT uid, session_uid, created_at FROM chat_threads "
+            "WHERE status='open' AND ((user_a=? AND user_b=?) OR (user_a=? AND user_b=?)) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (payload["user_uid"], candidate_uid, candidate_uid, payload["user_uid"]),
+        ).fetchone()
+        if row:
+            existing_threads_by_candidate[candidate_uid] = row
+
+    if len(existing_threads_by_candidate) == len(candidate_uids):
+        thread_ids = [existing_threads_by_candidate[uid]["uid"] for uid in candidate_uids]
+        session_id = existing_threads_by_candidate[candidate_uids[0]]["session_uid"]
+        conn.close()
+        return jsonify({"session_id": session_id, "thread_ids": thread_ids, "reused": True}), 200
+
+    candidate_type = "room" if len(candidate_uids) >= 2 else "individual"
+    delegate_uid = candidate_uids[0] if candidate_uids else ""
+    conn.execute(
+        "INSERT INTO match_sessions (uid, user_uid, candidate_uid, candidate_type, room_member_uids, delegate_uid, status, user_confirmed, candidate_confirmed, last_activity_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (session_id, payload["user_uid"], candidate_uids[0], candidate_type, ",".join(candidate_uids), delegate_uid, "active", 0, 0, now, now),
+    )
+
+    thread_ids = []
+    for candidate_uid in candidate_uids:
+        existing = existing_threads_by_candidate.get(candidate_uid)
+        if existing:
+            thread_ids.append(existing["uid"])
+            continue
+        thread_id = generate_uid()
+        thread_ids.append(thread_id)
+        conn.execute(
+            "INSERT INTO chat_threads (uid, session_uid, user_a, user_b, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (thread_id, session_id, payload["user_uid"], candidate_uid, "open", now),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"session_id": session_id, "thread_ids": thread_ids}), 201
+
+
+@app.route("/api/match/session/active", methods=["GET"])
+@login_required
+def get_active_sessions():
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    uid = payload["user_uid"]
+    rows = conn.execute(
+        "SELECT * FROM match_sessions "
+        "WHERE (user_uid=? OR candidate_uid=? OR room_member_uids=? OR room_member_uids LIKE ? OR room_member_uids LIKE ? OR room_member_uids LIKE ?) "
+        "AND status IN ('active','confirmed') ORDER BY created_at DESC",
+        (uid, uid, uid, f"{uid},%", f"%,{uid},%", f"%,{uid}"),
+    ).fetchall()
+    conn.close()
+    sessions = [dict(r) for r in rows]
+    return jsonify({"sessions": sessions})
+
+
+@app.route("/api/match/session/history", methods=["GET"])
+@login_required
+def get_session_history():
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    uid = payload["user_uid"]
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    sessions = conn.execute(
+        "SELECT * FROM match_sessions "
+        "WHERE (user_uid=? OR candidate_uid=? OR room_member_uids=? OR room_member_uids LIKE ? OR room_member_uids LIKE ? OR room_member_uids LIKE ?) "
+        "ORDER BY created_at DESC",
+        (uid, uid, uid, f"{uid},%", f"%,{uid},%", f"%,{uid}"),
+    ).fetchall()
+
+    result = []
+    for s in sessions:
+        thread_rows = conn.execute(
+            "SELECT * FROM chat_threads WHERE session_uid=? ORDER BY created_at DESC",
+            (s["uid"],),
+        ).fetchall()
+        thread_items = []
+        has_open_thread = False
+        for t in thread_rows:
+            other_uid = t["user_b"] if t["user_a"] == uid else t["user_a"]
+            if other_uid == uid:
+                continue
+            other = db.get_user_by_uid(other_uid)
+            if (t["status"] or "open") == "open":
+                has_open_thread = True
+            thread_items.append({
+                "thread_id": t["uid"],
+                "other_uid": other_uid,
+                "other_user": other.name if other else other_uid,
+                "status": t["status"] or "open",
+                "closed_reason": t["closed_reason"],
+                "created_at": t["created_at"],
+            })
+
+        if (s["status"] or "") == "confirmed":
+            ui_status = "match_success"
+        elif (s["status"] or "") == "rejected":
+            ui_status = "rejected"
+        elif (s["status"] or "") == "active" and ((s["user_decision"] or "") == "hold" or (s["candidate_decision"] or "") == "hold"):
+            ui_status = "on_hold"
+        elif has_open_thread:
+            ui_status = "in_progress"
+        else:
+            ui_status = "expired"
+        result.append({
+            "session_id": s["uid"],
+            "candidate_type": s["candidate_type"] or "individual",
+            "match_kind": "dormitory",
+            "created_at": s["created_at"],
+            "status": s["status"] or "",
+            "ui_status": ui_status,
+            "user_decision": s["user_decision"] or "",
+            "candidate_decision": s["candidate_decision"] or "",
+            "threads": thread_items,
+        })
+
+    conn.close()
+    return jsonify({"sessions": result})
+
+
+@app.route("/api/match/confirm", methods=["POST"])
+@login_required
+def confirm_match():
+    payload = request.current_user
+    data = request.get_json(force=True)
+    session_id = data.get("session_id", "")
+    _ = data.get("room_confirm_mode", "delegate")
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    return _confirm_match_internal(payload["user_uid"], session_id)
+
+
+def _confirm_match_internal(current_user_uid: str, session_id: str):
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    s = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (session_id,)).fetchone()
+    if not s:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+
+    room_members = [u.strip() for u in (s["room_member_uids"] or "").split(",") if u and u.strip()]
+    delegate_uid = (s["delegate_uid"] or "").strip() if "delegate_uid" in s.keys() else ""
+    if not delegate_uid and room_members:
+        delegate_uid = room_members[0]
+    effective_candidate_uid = delegate_uid or s["candidate_uid"]
+
+    if current_user_uid == s["user_uid"]:
+        conn.execute("UPDATE match_sessions SET user_confirmed=1, last_activity_at=? WHERE uid=?", (now, session_id))
+    elif current_user_uid == effective_candidate_uid:
+        conn.execute("UPDATE match_sessions SET candidate_confirmed=1, last_activity_at=? WHERE uid=?", (now, session_id))
+    elif current_user_uid in room_members:
+        conn.execute("UPDATE match_sessions SET last_activity_at=? WHERE uid=?", (now, session_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"session_id": session_id, "status": "waiting_delegate", "delegate_uid": effective_candidate_uid})
+    else:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+
+    s = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (session_id,)).fetchone()
+    if s["user_confirmed"] and s["candidate_confirmed"]:
+        conn.execute("UPDATE match_sessions SET status='confirmed', confirmed_at=? WHERE uid=?", (now, session_id))
+        conn.execute(
+            "INSERT INTO match_history (uid, session_uid, user_a, user_b, status, matched_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (generate_uid(), session_id, s["user_uid"], s["candidate_uid"], "active", now),
+        )
+        cooldown_until = (datetime.datetime.utcnow() + datetime.timedelta(days=3)).isoformat() + "Z"
+        counterpart_uids = [s["candidate_uid"]]
+        if room_members:
+            counterpart_uids = room_members
+        notify_uids = [s["user_uid"], *counterpart_uids]
+
+        for u in notify_uids:
+            conn.execute(
+                "INSERT OR REPLACE INTO match_cooldowns (uid, user_uid, cooldown_until, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                (generate_uid(), u, cooldown_until, "matched", now),
+            )
+
+        others = conn.execute(
+            "SELECT uid FROM match_sessions WHERE uid<>? AND status='active' AND (user_uid IN (?, ?) OR candidate_uid IN (?, ?))",
+            (session_id, s["user_uid"], s["candidate_uid"], s["user_uid"], s["candidate_uid"]),
+        ).fetchall()
+        for row in others:
+            conn.execute("UPDATE match_sessions SET status='closed', closed_at=? WHERE uid=?", (now, row["uid"]))
+            thread_rows = conn.execute(
+                "SELECT uid, user_a, user_b FROM chat_threads WHERE session_uid=? AND status='open'",
+                (row["uid"],),
+            ).fetchall()
+            for t in thread_rows:
+                conn.execute(
+                    "UPDATE chat_threads SET status='closed', closed_reason='already_matched', closed_at=? WHERE uid=?",
+                    (now, t["uid"]),
+                )
+                _insert_system_message(
+                    conn=conn,
+                    thread_uid=t["uid"],
+                    session_uid=row["uid"],
+                    sender="system",
+                    receiver=t["user_a"],
+                    content="사용자가 이미 매칭됨",
+                )
+                _insert_system_message(
+                    conn=conn,
+                    thread_uid=t["uid"],
+                    session_uid=row["uid"],
+                    sender="system",
+                    receiver=t["user_b"],
+                    content="사용자가 이미 매칭됨",
+                )
+                _broadcast_thread_state(conn, t["uid"], "already_matched")
+
+        conn.commit()
+        conn.close()
+        for u in notify_uids:
+            broadcast_message(u, "match_confirmed", {"session_id": session_id, "event_type": "match_confirmed"})
+        return jsonify({"session_id": session_id, "status": "confirmed"})
+
+    conn.commit()
+    conn.close()
+    return jsonify({"session_id": session_id, "status": "waiting"})
+
+
+@app.route("/api/match/session/<session_id>/confirm", methods=["POST"])
+@login_required
+def confirm_session_compat(session_id):
+    payload = request.current_user
+    return _confirm_match_internal(payload["user_uid"], session_id)
+
+
+@app.route("/api/match/session/<session_id>/cancel", methods=["POST"])
+@login_required
+def cancel_session_compat(session_id):
+    payload = request.current_user
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    s = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (session_id,)).fetchone()
+    if not s:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+    if payload["user_uid"] not in (s["user_uid"], s["candidate_uid"]):
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    conn.execute("UPDATE match_sessions SET status='cancelled', closed_at=? WHERE uid=?", (now, session_id))
+    thread_rows = conn.execute(
+        "SELECT uid FROM chat_threads WHERE session_uid=?",
+        (session_id,),
+    ).fetchall()
+    conn.execute(
+        "UPDATE chat_threads SET status='closed', closed_reason='cancelled', closed_at=? WHERE session_uid=?",
+        (now, session_id),
+    )
+    for t in thread_rows:
+        _broadcast_thread_state(conn, t["uid"], "cancelled")
+    conn.commit()
+    conn.close()
+    return jsonify({"session_id": session_id, "status": "cancelled"})
+
+
+@app.route("/api/match/rematch", methods=["POST"])
+@login_required
+def rematch():
+    payload = request.current_user
+    data = request.get_json(force=True)
+    session_id = data.get("session_id", "")
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    s = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (session_id,)).fetchone()
+    if not s:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+    if payload["user_uid"] not in (s["user_uid"], s["candidate_uid"]):
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    row = conn.execute("SELECT cooldown_until FROM match_cooldowns WHERE user_uid=?", (payload["user_uid"],)).fetchone()
+    if row and row["cooldown_until"]:
+        t = _parse_ts(row["cooldown_until"])
+        if t and datetime.datetime.utcnow() < t:
+            conn.close()
+            return jsonify({"error": "cooldown active", "cooldown_until": row["cooldown_until"]}), 403
+
+    conn.execute("UPDATE match_sessions SET status='closed', closed_at=? WHERE uid=?", (_now(), session_id))
+    thread_rows = conn.execute(
+        "SELECT uid FROM chat_threads WHERE session_uid=?",
+        (session_id,),
+    ).fetchall()
+    conn.execute(
+        "UPDATE chat_threads SET status='closed', closed_reason='rematch', closed_at=? WHERE session_uid=?",
+        (_now(), session_id),
+    )
+    for t in thread_rows:
+        _broadcast_thread_state(conn, t["uid"], "rematch")
+    conn.commit()
+    conn.close()
+    other = s["candidate_uid"] if payload["user_uid"] == s["user_uid"] else s["user_uid"]
+    broadcast_message(other, "rematch_notice", {
+        "event_type": "rematch_notice",
+        "session_id": session_id,
+        "user_uid": payload["user_uid"],
+    })
+    return jsonify({"ok": True, "status": "closed"})
+
+
+@app.route("/api/match/cooldown", methods=["GET"])
+@login_required
+def get_cooldown():
+    payload = request.current_user
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT cooldown_until FROM match_cooldowns WHERE user_uid=?", (payload["user_uid"],)).fetchone()
+    conn.close()
+    if not row or not row["cooldown_until"]:
+        return jsonify({"in_cooldown": False, "cooldown_until": None})
+    t = _parse_ts(row["cooldown_until"])
+    if t and datetime.datetime.utcnow() >= t:
+        return jsonify({"in_cooldown": False, "cooldown_until": row["cooldown_until"]})
+    return jsonify({"in_cooldown": True, "cooldown_until": row["cooldown_until"]})
+
+
+@app.route("/api/chat/threads", methods=["GET"])
+@login_required
+def get_threads():
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_thread_leaves_table(conn)
+    rows = conn.execute(
+        "SELECT t.* FROM chat_threads t "
+        "WHERE (t.user_a=? OR t.user_b=?) "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM chat_thread_leaves l WHERE l.thread_uid=t.uid AND l.user_uid=?"
+        ") "
+        "ORDER BY t.created_at DESC",
+        (payload["user_uid"], payload["user_uid"], payload["user_uid"]),
+    ).fetchall()
+    conn.close()
+    threads = []
+    for r in rows:
+        other_uid = r["user_b"] if r["user_a"] == payload["user_uid"] else r["user_a"]
+        other = db.get_user_by_uid(other_uid)
+        threads.append({
+            "thread_id": r["uid"],
+            "session_id": r["session_uid"],
+            "other_uid": other_uid,
+            "other_user": other.name if other else other_uid,
+            "status": r["status"],
+            "closed_reason": r["closed_reason"],
+            "chat_exchange_count": int(r["chat_exchange_count"] or 0),
+            "created_at": r["created_at"],
+        })
+    return jsonify({"threads": threads})
+
+
+@app.route("/api/chat/threads/<thread_id>/meta", methods=["GET"])
+@login_required
+def get_thread_meta(thread_id):
+    payload = request.current_user
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)",
+        (thread_id, payload["user_uid"], payload["user_uid"]),
+    ).fetchone()
+    if not thread:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    session = conn.execute(
+        "SELECT * FROM match_sessions WHERE uid=?",
+        (thread["session_uid"],),
+    ).fetchone()
+    if not session:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+
+    side = _session_side_for_user(session, payload["user_uid"])
+    if side is None:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+
+    count = int(thread["chat_exchange_count"] or 0)
+    if side == "user":
+        my_survey_opened = int(session["user_survey_opened"] or 0) == 1
+        other_survey_opened = int(session["candidate_survey_opened"] or 0) == 1
+        my_decision = (session["user_decision"] or "").strip()
+        other_decision = (session["candidate_decision"] or "").strip()
+    else:
+        my_survey_opened = int(session["candidate_survey_opened"] or 0) == 1
+        other_survey_opened = int(session["user_survey_opened"] or 0) == 1
+        my_decision = (session["candidate_decision"] or "").strip()
+        other_decision = (session["user_decision"] or "").strip()
+    conn.close()
+
+    return jsonify({
+        "thread_id": thread_id,
+        "session_id": session["uid"],
+        "message_count": count,
+        "survey_enabled": count >= 4,
+        "matching_enabled": count >= 7,
+        "my_survey_opened": my_survey_opened,
+        "other_survey_opened": other_survey_opened,
+        "my_decision": my_decision,
+        "other_decision": other_decision,
+        "session_status": session["status"] or "",
+    })
+
+
+@app.route("/api/chat/threads/<thread_id>/survey/open", methods=["POST"])
+@login_required
+def open_thread_survey(thread_id):
+    payload = request.current_user
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)",
+        (thread_id, payload["user_uid"], payload["user_uid"]),
+    ).fetchone()
+    if not thread:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    session = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (thread["session_uid"],)).fetchone()
+    if not session:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+    side = _session_side_for_user(session, payload["user_uid"])
+    if side is None:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+
+    count = int(thread["chat_exchange_count"] or 0)
+    if count < 4:
+        conn.close()
+        return jsonify({"error": "survey_locked", "required": 4, "message_count": count}), 403
+
+    now = _now()
+    if side == "user":
+        conn.execute(
+            "UPDATE match_sessions SET user_survey_opened=1, last_activity_at=? WHERE uid=?",
+            (now, session["uid"]),
+        )
+    else:
+        conn.execute(
+            "UPDATE match_sessions SET candidate_survey_opened=1, last_activity_at=? WHERE uid=?",
+            (now, session["uid"]),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "opened": True})
+
+
+@app.route("/api/chat/threads/<thread_id>/survey/opened-profile", methods=["GET"])
+@login_required
+def get_opened_survey_profile(thread_id):
+    payload = request.current_user
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)",
+        (thread_id, payload["user_uid"], payload["user_uid"]),
+    ).fetchone()
+    if not thread:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    session = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (thread["session_uid"],)).fetchone()
+    if not session:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+    side = _session_side_for_user(session, payload["user_uid"])
+    if side is None:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+
+    if side == "user":
+        if int(session["candidate_survey_opened"] or 0) != 1:
+            conn.close()
+            return jsonify({"error": "survey_not_opened"}), 403
+    else:
+        if int(session["user_survey_opened"] or 0) != 1:
+            conn.close()
+            return jsonify({"error": "survey_not_opened"}), 403
+
+    other_uid = thread["user_b"] if thread["user_a"] == payload["user_uid"] else thread["user_a"]
+    profile = db.get_profile_by_user_uid(other_uid)
+    if not profile:
+        conn.close()
+        return jsonify({"error": "profile not found"}), 404
+    reviews = conn.execute(
+        "SELECT * FROM reviews WHERE reviewee=? ORDER BY created_at DESC",
+        (other_uid,),
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "other_uid": other_uid,
+        "profile": profile_to_dict(profile),
+        "reviews": [dict(r) for r in reviews],
+    })
+
+
+@app.route("/api/chat/threads/<thread_id>/match-decision", methods=["POST"])
+@login_required
+def decide_thread_match(thread_id):
+    payload = request.current_user
+    data = request.get_json(force=True) or {}
+    action = (data.get("action") or "").strip().lower()
+    reason = (data.get("reason") or "").strip()
+    if action not in ("accept", "reject", "hold"):
+        return jsonify({"error": "action must be one of accept/reject/hold"}), 400
+    if action == "reject" and len(reason) < 5:
+        return jsonify({"error": "reject reason must be at least 5 characters"}), 400
+
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_thread_leaves_table(conn)
+    thread = conn.execute(
+        "SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)",
+        (thread_id, payload["user_uid"], payload["user_uid"]),
+    ).fetchone()
+    if not thread:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    session = conn.execute("SELECT * FROM match_sessions WHERE uid=?", (thread["session_uid"],)).fetchone()
+    if not session:
+        conn.close()
+        return jsonify({"error": "session not found"}), 404
+    side = _session_side_for_user(session, payload["user_uid"])
+    if side is None:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    if (session["status"] or "") not in ("active", "confirmed"):
+        conn.close()
+        return jsonify({"error": "session_closed"}), 403
+
+    count = _chat_exchange_count(conn, thread_id)
+    if count < 7:
+        conn.close()
+        return jsonify({"error": "matching_locked", "required": 7, "message_count": count}), 403
+
+    if side == "user":
+        my_decision_col = "user_decision"
+        my_reason_col = "user_reject_reason"
+        other_decision = (session["candidate_decision"] or "").strip()
+    else:
+        my_decision_col = "candidate_decision"
+        my_reason_col = "candidate_reject_reason"
+        other_decision = (session["user_decision"] or "").strip()
+
+    if action == "hold":
+        conn.execute(
+            f"UPDATE match_sessions SET {my_decision_col}='hold', {my_reason_col}=NULL, last_activity_at=? WHERE uid=?",
+            (now, session["uid"]),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "status": "on_hold"})
+
+    if action == "reject":
+        conn.execute(
+            f"UPDATE match_sessions SET status='rejected', {my_decision_col}='rejected', {my_reason_col}=?, closed_at=?, last_activity_at=? WHERE uid=?",
+            (reason, now, now, session["uid"]),
+        )
+        thread_rows = conn.execute(
+            "SELECT uid FROM chat_threads WHERE session_uid=?",
+            (session["uid"],),
+        ).fetchall()
+        conn.execute(
+            "UPDATE chat_threads SET status='closed', closed_reason='rejected', closed_at=? WHERE session_uid=?",
+            (now, session["uid"]),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO chat_thread_leaves (thread_uid, user_uid, left_at) VALUES (?, ?, ?)",
+            (thread_id, payload["user_uid"], now),
+        )
+        for t in thread_rows:
+            _broadcast_thread_state(
+                conn,
+                t["uid"],
+                "rejected",
+                {"rejected_by": payload["user_uid"], "reject_reason": reason},
+            )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "status": "rejected", "left_thread": True})
+
+    conn.execute(
+        f"UPDATE match_sessions SET {my_decision_col}='accepted', {my_reason_col}=NULL, last_activity_at=? WHERE uid=?",
+        (now, session["uid"]),
+    )
+    matched = other_decision == "accepted"
+    if matched:
+        conn.execute(
+            "UPDATE match_sessions SET status='confirmed', confirmed_at=?, last_activity_at=? WHERE uid=?",
+            (now, now, session["uid"]),
+        )
+        conn.execute(
+            "INSERT INTO match_history (uid, session_uid, user_a, user_b, status, matched_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (generate_uid(), session["uid"], session["user_uid"], session["candidate_uid"], "active", now),
+        )
+        counterpart_uids = [session["candidate_uid"]]
+        room_members = [u.strip() for u in (session["room_member_uids"] or "").split(",") if u and u.strip()]
+        if room_members:
+            counterpart_uids = room_members
+        notify_uids = [session["user_uid"], *counterpart_uids]
+        for u in notify_uids:
+            conn.execute(
+                "INSERT OR REPLACE INTO match_cooldowns (uid, user_uid, cooldown_until, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                (generate_uid(), u, None, "matched", now),
+            )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "status": "confirmed" if matched else "waiting"})
+
+
+@app.route("/api/chat/threads/<thread_id>/messages", methods=["POST"])
+@login_required
+def send_thread_message(thread_id):
+    payload = request.current_user
+    data = request.get_json(force=True)
+    content = data.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+    msg_type = data.get("type", "text")
+    now = _now()
+    expires = (datetime.datetime.utcnow() + datetime.timedelta(days=CHAT_RETENTION_DAYS)).isoformat() + "Z"
+
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    t = conn.execute("SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)", (thread_id, payload["user_uid"], payload["user_uid"])).fetchone()
+    if not t:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    if t["status"] != "open":
+        conn.close()
+        return jsonify({"error": "thread is closed"}), 403
+    receiver = t["user_b"] if t["user_a"] == payload["user_uid"] else t["user_a"]
+    uid = generate_uid()
+    conn.execute(
+        "INSERT INTO chat_messages (uid, session_uid, thread_uid, sender, receiver, content, type, read, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (uid, t["session_uid"], thread_id, payload["user_uid"], receiver, content, msg_type, 0, expires, now),
+    )
+    conn.execute(
+        "UPDATE chat_threads SET last_message_at=?, chat_exchange_count=COALESCE(chat_exchange_count, 0)+1 WHERE uid=?",
+        (now, thread_id),
+    )
+    conn.execute("UPDATE match_sessions SET last_activity_at=? WHERE uid=?", (now, t["session_uid"]))
+    conn.commit()
+    conn.close()
+
+    broadcast_message(receiver, "chat_message", {
+        "event_type": "chat_message",
+        "uid": uid,
+        "thread_id": thread_id,
+        "session_id": t["session_uid"],
+        "sender": payload["user_uid"],
+        "content": content,
+        "type": msg_type,
+        "created_at": now,
+        "expire_at": expires,
+    })
+    return jsonify({"uid": uid, "created_at": now, "expire_at": expires}), 201
+
+
+@app.route("/api/chat/threads/<thread_id>/messages", methods=["GET"])
+@login_required
+def get_thread_messages(thread_id):
+    payload = request.current_user
+    _expire_chat_messages_and_sessions()
+    limit = request.args.get("limit", 50, type=int)
+    before_created_at = (request.args.get("before_created_at") or "").strip()
+    before_uid = (request.args.get("before_uid") or "").strip()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    t = conn.execute("SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)", (thread_id, payload["user_uid"], payload["user_uid"])).fetchone()
+    if not t:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    if before_created_at:
+        cursor_uid = before_uid or "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+        rows = conn.execute(
+            "SELECT * FROM chat_messages "
+            "WHERE thread_uid=? "
+            "AND (created_at < ? OR (created_at = ? AND uid < ?)) "
+            "ORDER BY created_at DESC, uid DESC "
+            "LIMIT ?",
+            (thread_id, before_created_at, before_created_at, cursor_uid, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM chat_messages "
+            "WHERE thread_uid=? "
+            "ORDER BY created_at DESC, uid DESC "
+            "LIMIT ?",
+            (thread_id, limit),
+        ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in reversed(rows)])
+
+
+@app.route("/api/chat/threads/<thread_id>/read", methods=["POST"])
+@login_required
+def mark_thread_read(thread_id):
+    payload = request.current_user
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    t = conn.execute("SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)", (thread_id, payload["user_uid"], payload["user_uid"])).fetchone()
+    if not t:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+    conn.execute(
+        "UPDATE chat_messages SET read=1, delivered_at=? WHERE thread_uid=? AND receiver=? AND read=0",
+        (now, thread_id, payload["user_uid"]),
+    )
+    conn.execute(
+        "DELETE FROM chat_messages WHERE thread_uid=? AND receiver=? AND delivered_at IS NOT NULL",
+        (thread_id, payload["user_uid"]),
+    )
+    conn.execute("UPDATE match_sessions SET last_activity_at=? WHERE uid=?", (now, t["session_uid"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chat/threads/<thread_id>/leave", methods=["POST"])
+@login_required
+def leave_thread(thread_id):
+    payload = request.current_user
+    now = _now()
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_thread_leaves_table(conn)
+    t = conn.execute(
+        "SELECT * FROM chat_threads WHERE uid=? AND (user_a=? OR user_b=?)",
+        (thread_id, payload["user_uid"], payload["user_uid"]),
+    ).fetchone()
+    if not t:
+        conn.close()
+        return jsonify({"error": "thread not found"}), 404
+
+    if t["status"] == "open":
+        conn.execute(
+            "UPDATE chat_threads SET status='closed', closed_reason='left', closed_at=? WHERE uid=?",
+            (now, thread_id),
+        )
+        conn.execute(
+            "UPDATE match_sessions SET last_activity_at=? WHERE uid=?",
+            (now, t["session_uid"]),
+        )
+        _broadcast_thread_state(conn, thread_id, "left", {"left_by": payload["user_uid"]})
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_thread_leaves (thread_uid, user_uid, left_at) VALUES (?, ?, ?)",
+        (thread_id, payload["user_uid"], now),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chat/ack", methods=["POST"])
+@login_required
+def chat_ack():
+    # Deprecated: immediate ACK-delete is disabled.
+    # Messages are deleted only when /api/chat/threads/{thread_id}/read is called.
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chat/local/threads/<thread_id>/messages", methods=["GET"])
+@login_required
+def get_local_thread_messages(thread_id):
+    payload = request.current_user
+    conn = _forlocal_conn()
+    row = conn.execute(
+        "SELECT messages_json FROM local_chat_snapshots WHERE user_uid=? AND thread_uid=?",
+        (payload["user_uid"], thread_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"messages": []})
+    try:
+        messages = json.loads(row["messages_json"] or "[]")
+        if not isinstance(messages, list):
+            messages = []
+    except Exception:
+        messages = []
+    return jsonify({"messages": messages})
+
+
+@app.route("/api/chat/local/threads/<thread_id>/messages", methods=["PUT"])
+@login_required
+def put_local_thread_messages(thread_id):
+    payload = request.current_user
+    data = request.get_json(force=True) or {}
+    messages = data.get("messages", [])
+    if not isinstance(messages, list):
+        return jsonify({"error": "messages must be list"}), 400
+    now = _now()
+    conn = _forlocal_conn()
+    conn.execute(
+        "INSERT INTO local_chat_snapshots (user_uid, thread_uid, messages_json, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_uid, thread_uid) DO UPDATE SET messages_json=excluded.messages_json, updated_at=excluded.updated_at",
+        (payload["user_uid"], thread_id, json.dumps(messages, ensure_ascii=False), now),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "updated_at": now})
+
+
+@app.route("/api/chat/local/threads/<thread_id>/messages", methods=["DELETE"])
+@login_required
+def delete_local_thread_messages(thread_id):
+    payload = request.current_user
+    conn = _forlocal_conn()
+    conn.execute(
+        "DELETE FROM local_chat_snapshots WHERE user_uid=? AND thread_uid=?",
+        (payload["user_uid"], thread_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+# ??? Reviews ?????????????????????????????????????????????????????????????
 
 @app.route("/api/reviews", methods=["POST"])
 @login_required
@@ -474,7 +2389,7 @@ def create_review():
     rating = data.get("rating")
     body = data.get("body", "").strip()
     if not reviewee or rating is None:
-        return jsonify({"error": "reviewee와 rating은 필수입니다."}), 400
+        return jsonify({"error": "reviewee? rating? ?꾩닔?낅땲??"}), 400
 
     uid = generate_uid()
     now = _now()
@@ -501,7 +2416,7 @@ def list_reviews(reviewee):
     return jsonify([dict(r) for r in rows])
 
 
-# ─── Stats ───────────────────────────────────────────────────────────────
+# ??? Stats ???????????????????????????????????????????????????????????????
 
 @app.route("/api/stats", methods=["GET"])
 def stats():
@@ -512,8 +2427,9 @@ def stats():
     return jsonify({"users": user_count, "profiles": profile_count})
 
 
-# ─── Init ────────────────────────────────────────────────────────────────
+# ??? Init ????????????????????????????????????????????????????????????????
 
 if __name__ == "__main__":
     db.init_db()
     app.run(host="0.0.0.0", port=5000, debug=True)
+

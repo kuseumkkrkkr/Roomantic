@@ -45,6 +45,15 @@ class Profile {
   int mealTogether;
   int exerciseTogether;
   int friendInvite;
+  // Legacy single hall field (kept for backward compat)
+  String dormitoryHall;
+  // New matching protocol fields
+  String matchingPhase; // 'preliminary' | 'main'
+  List<String> hopeHalls; // max 2 in preliminary
+  String acceptedHall; // 1 in main phase
+  int roomCapacity; // 2, 3, or 4
+  List<String> nonNegotiableItems;
+  List<int> nonNegotiableWeights;
 
   Profile({
     this.uid,
@@ -93,6 +102,13 @@ class Profile {
     this.mealTogether = 2,
     this.exerciseTogether = 1,
     this.friendInvite = 1,
+    this.dormitoryHall = '',
+    this.matchingPhase = 'preliminary',
+    this.hopeHalls = const [],
+    this.acceptedHall = '',
+    this.roomCapacity = 2,
+    this.nonNegotiableItems = const [],
+    this.nonNegotiableWeights = const [],
   });
 
   factory Profile.fromJson(Map<String, dynamic> json) {
@@ -143,6 +159,13 @@ class Profile {
       mealTogether: json['meal_together'] ?? 2,
       exerciseTogether: json['exercise_together'] ?? 1,
       friendInvite: json['friend_invite'] ?? 1,
+      dormitoryHall: json['dormitory_hall'] ?? '',
+      matchingPhase: json['matching_phase'] ?? 'preliminary',
+      hopeHalls: (json['hope_halls'] as List<dynamic>?)?.cast<String>() ?? const [],
+      acceptedHall: json['accepted_hall'] ?? '',
+      roomCapacity: json['room_capacity'] ?? 2,
+      nonNegotiableItems: (json['non_negotiable_items'] as List<dynamic>?)?.cast<String>() ?? const [],
+      nonNegotiableWeights: (json['non_negotiable_weights'] as List<dynamic>?)?.cast<int>() ?? const [],
     );
   }
 
@@ -170,6 +193,13 @@ class Profile {
       noiseSensitivity: noiseSensitivity, desiredIntimacy: desiredIntimacy,
       mealTogether: mealTogether, exerciseTogether: exerciseTogether,
       friendInvite: friendInvite,
+      dormitoryHall: dormitoryHall,
+      matchingPhase: matchingPhase,
+      hopeHalls: List<String>.from(hopeHalls),
+      acceptedHall: acceptedHall,
+      roomCapacity: roomCapacity,
+      nonNegotiableItems: nonNegotiableItems,
+      nonNegotiableWeights: nonNegotiableWeights,
     );
   }
 
@@ -215,5 +245,12 @@ class Profile {
         'meal_together': mealTogether,
         'exercise_together': exerciseTogether,
         'friend_invite': friendInvite,
+        'dormitory_hall': dormitoryHall,
+        'matching_phase': matchingPhase,
+        'hope_halls': hopeHalls,
+        'accepted_hall': acceptedHall,
+        'room_capacity': roomCapacity,
+        'non_negotiable_items': nonNegotiableItems,
+        'non_negotiable_weights': nonNegotiableWeights,
       };
 }
